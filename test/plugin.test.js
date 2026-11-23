@@ -1,0 +1,1282 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * Plugin validation tests for Anthropic Channels allowlist submission.
+ *
+ * Tests:
+ *   1. plugin.json is valid and has all required fields
+ *   2. MCP server module loads without error
+ *   3. The peer allowlist takes nodeIds (names are labels)
+ *   4. Own records are judged by nodeId
+ *   5. Clean shutdown signal handling
+ *   6. Security: no permission relay capability declared
+ */
+
+require('./_harness.js'); // sandbox first: no installer test may reach the real ~/.claude.json or ~/.sym
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+const assert = require('assert');
+
+let passed = 0;
+let failed = 0;
+
+function test(name, fn) {
+  try {
+    fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    failed++;
+    console.log(`  ✗ ${name}`);
+    console.log(`    ${e.message}`);
+  }
+}
+
+async function testAsync(name, fn) {
+  try {
+    await fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (e) {
+    failed++;
+    console.log(`  ✗ ${name}`);
+    console.log(`    ${e.message}`);
+  }
+}
+
+console.log('\nsym-mesh-channel plugin tests\n');
+
+// ── 1. Plugin manifest validation ───────────────────────────
+
+console.log('Plugin manifest:');
+
+test('plugin.json exists and is valid JSON', () => {
+  const manifestPath = path.join(__dirname, '..', '.claude-plugin', 'plugin.json');
+  assert.ok(fs.existsSync(manifestPath), 'plugin.json not found');
+  const raw = fs.readFileSync(manifestPath, 'utf8');
+  const manifest = JSON.parse(raw);
+  assert.ok(manifest, 'Failed to parse plugin.json');
+});
+
+test('plugin.json has required name field', () => {
+  const manifest = loadManifest();
+  assert.ok(manifest.name, 'name field is missing');
+  assert.strictEqual(typeof manifest.name, 'string');
+  assert.ok(manifest.name.length > 0, 'name is empty');
+});
+
+test('.mcp.json has mcpServers with claude-sym-mesh', () => {
+  const mcp = loadMcpJson();
+  assert.ok(mcp.mcpServers, 'mcpServers field is missing');
+  assert.ok(mcp.mcpServers['claude-sym-mesh'], 'claude-sym-mesh server not defined');
+  const server = mcp.mcpServers['claude-sym-mesh'];
+  // Launch migrated to npx in 0.3.8 (per-session identity + npx launch);
+  // the server is no longer spawned via a bundled `node server.js` path.
+  assert.strictEqual(server.command, 'npx', 'command should be npx');
+  assert.ok(Array.isArray(server.args), 'args should be an array');
+  assert.ok(
+    server.args.some((a) => a.includes('@sym-bot/mesh-channel')),
+    'args should launch the @sym-bot/mesh-channel package'
+  );
+});
+
+test('plugin.json declares channels with userConfig', () => {
+  const manifest = loadManifest();
+  assert.ok(Array.isArray(manifest.channels), 'channels should be an array');
+  assert.ok(manifest.channels.length > 0, 'channels should not be empty');
+  const channel = manifest.channels[0];
+  assert.strictEqual(channel.server, 'claude-sym-mesh', 'channel server should match mcpServers key');
+  assert.ok(channel.userConfig, 'userConfig is missing');
+});
+
+test('relay_token is marked sensitive', () => {
+  const manifest = loadManifest();
+  const channel = manifest.channels[0];
+  assert.ok(channel.userConfig.relay_token, 'relay_token config missing');
+  assert.strictEqual(channel.userConfig.relay_token.sensitive, true, 'relay_token must be sensitive');
+});
+
+test('version matches npm package version', () => {
+  const manifest = loadManifest();
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  assert.strictEqual(manifest.version, pkg.version, `plugin version (${manifest.version}) should match package version (${pkg.version})`);
+});
+
+test('.mcp.json launch pin matches npm package version', () => {
+  // The .mcp.json args are what a seat actually RUNS after /plugin update — a lagging pin
+  // ships the old runtime under a new plugin version (v0.5.4 launched 0.5.3 this way).
+  const mcp = loadMcpJson();
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const pinArg = mcp.mcpServers['claude-sym-mesh'].args.find((a) => a.includes('@sym-bot/mesh-channel'));
+  assert.strictEqual(
+    pinArg,
+    `@sym-bot/mesh-channel@${pkg.version}`,
+    `.mcp.json launches ${pinArg} but package version is ${pkg.version}`
+  );
+});
+
+test('channels server matches .mcp.json server key', () => {
+  const manifest = loadManifest();
+  const mcp = loadMcpJson();
+  const channelServer = manifest.channels[0].server;
+  assert.ok(mcp.mcpServers[channelServer], `channels server "${channelServer}" must match a key in .mcp.json mcpServers`);
+});
+
+// ── 2. Server module validation ─────────────────────────────
+
+console.log('\nServer module:');
+
+test('server.js exists in node_modules', () => {
+  const serverPath = resolveServerJs();
+  assert.ok(fs.existsSync(serverPath), `server.js not found at ${serverPath}`);
+});
+
+test('server.js is valid JavaScript', () => {
+  const serverPath = resolveServerJs();
+  const code = fs.readFileSync(serverPath, 'utf8');
+  // Basic syntax check — ensure it parses without throwing
+  // (can't actually run it because it starts the MCP server)
+  assert.ok(code.includes('notifications/claude/channel'), 'server should declare channel capability');
+  assert.ok(code.includes('claude/channel'), 'server should use channel notifications');
+});
+
+// ── 3. Security: peer allowlist (nodeIds since 0.11) ────────
+
+console.log('\nSecurity - peer allowlist:');
+
+test('SYM_ALLOWED_PEERS takes nodeIds; empty admits every verified signer', () => {
+  const { readAllowedPeers } = require('../delivery-policy.js');
+  assert.deepStrictEqual(readAllowedPeers('').nodeIds, []);
+  assert.strictEqual(readAllowedPeers('').failClosed, false);
+  const id = '01a0fd15-52ca-726c-9ce1-5767a1379249';
+  assert.deepStrictEqual(readAllowedPeers(` ${id} , `).nodeIds, [id], 'whitespace is trimmed');
+});
+
+test('a list of names is not an allowlist of identities: it is reported and fails closed', () => {
+  const { readAllowedPeers } = require('../delivery-policy.js');
+  const r = readAllowedPeers('claude-mac,claude-win');
+  assert.deepStrictEqual(r.ignored, ['claude-mac', 'claude-win']);
+  assert.strictEqual(r.failClosed, true);
+});
+
+// ── 4. Security: no permission relay ────────────────────────
+
+console.log('\nSecurity - capability restrictions:');
+
+test('server does NOT declare claude/channel/permission capability', () => {
+  const serverPath = resolveServerJs();
+  const code = fs.readFileSync(serverPath, 'utf8');
+  assert.ok(!code.includes('claude/channel/permission'),
+    'server MUST NOT declare permission relay capability — mesh peers must not approve/deny tool executions');
+});
+
+test('server does NOT execute code from mesh signals', () => {
+  const serverPath = resolveServerJs();
+  const code = fs.readFileSync(serverPath, 'utf8');
+  // Ensure pushChannel only sends text, never calls eval/exec/spawn from mesh input
+  assert.ok(!code.includes('eval('), 'server must not use eval');
+  // child_process spawn is OK for the server itself, but not from mesh input
+  const pushChannelSection = code.slice(code.indexOf('function pushChannel'));
+  assert.ok(!pushChannelSection.includes('spawn('), 'pushChannel must not spawn processes from mesh input');
+});
+
+test('a record this node signed is counted as its own, by nodeId, never shown as a peer\'s', () => {
+  const policy = fs.readFileSync(path.join(__dirname, '..', 'delivery-policy.js'), 'utf8');
+  assert.ok(policy.includes("signer === selfNodeId) return { bucket: 'own' }"), 'own records are judged by the signer nodeId');
+});
+
+// ── 4b. Tool surface — CAT7 CMB emission, with lineage ──
+
+console.log('\nTool surface — sym_send / sym_publish:');
+
+function toolBlock(code, name, next) {
+  const i = code.indexOf(`name: '${name}'`);
+  assert.ok(i !== -1, `${name} tool descriptor not found`);
+  const j = code.indexOf(`name: '${next}'`, i);
+  return code.slice(i, j === -1 ? i + 3000 : j);
+}
+
+test('sym_send: focus required, to (a nodeId or a delivery id), parents for lineage, no raw message', () => {
+  const d = toolBlock(fs.readFileSync(resolveServerJs(), 'utf8'), 'sym_send', 'sym_publish');
+  assert.ok(d.includes("required: ['focus']"));
+  assert.ok(d.includes('to: {'), 'targeted send (§4.4.4)');
+  assert.ok(d.includes('parents: PARENTS_PROP'), 'lineage at the emit surface (audit C-3.1)');
+  assert.ok(!/message:\s*\{\s*type:\s*'string'/.test(d), 'no raw-text message field');
+});
+
+test('sym_publish: focus required and parents accepted', () => {
+  const d = toolBlock(fs.readFileSync(resolveServerJs(), 'utf8'), 'sym_publish', 'sym_receive');
+  assert.ok(d.includes("required: ['focus']"));
+  assert.ok(d.includes('parents: PARENTS_PROP'));
+});
+
+test('emission goes through the host to node.remember(), with parents and to, and never node.send()', () => {
+  const code = fs.readFileSync(resolveServerJs(), 'utf8');
+  assert.ok(code.includes('host.emitRecord({ categories, to, parents: par.keys'), 'the server emits through the host');
+  const host = fs.readFileSync(path.join(__dirname, '..', 'node-host.js'), 'utf8');
+  assert.ok(host.includes('node.remember(categories, {'), 'the node host emits via remember() — a signed CAT7 CMB');
+  assert.ok(host.includes('parents: parents.map((key) => ({ key }))'));
+  assert.ok(!/node\.send\(/.test(host) && !/node\.send\(/.test(code), 'no raw node.send()');
+});
+
+test('`to` is resolved by identity, never by name', () => {
+  const code = fs.readFileSync(resolveServerJs(), 'utf8');
+  assert.ok(code.includes('cd.resolveTo(args.to'), 'to goes through resolveTo');
+  assert.ok(!/p\.name === args\.to/.test(code), 'no name match routes a send');
+});
+
+test('the instructions teach lineage, the verification line, and that to never takes a name', () => {
+  const code = fs.readFileSync(resolveServerJs(), 'utf8');
+  assert.ok(code.includes('MMP §14.3'));
+  assert.ok(code.includes('SVAF'));
+  assert.ok(code.includes('`to` never takes a name'));
+});
+
+// ── 5. Server lifecycle ─────────────────────────────────────
+
+console.log('\nServer lifecycle:');
+
+test('clean shutdown handlers registered', () => {
+  const serverPath = resolveServerJs();
+  const code = fs.readFileSync(serverPath, 'utf8');
+  assert.ok(code.includes("process.on('SIGTERM'"), 'SIGTERM handler missing');
+  assert.ok(code.includes("process.on('SIGINT'"), 'SIGINT handler missing');
+});
+
+test('the room beacon reads the port from status(), not an SDK internal', () => {
+  const code = fs.readFileSync(resolveServerJs(), 'utf8');
+  assert.ok(code.includes('host.status().port'));
+  assert.ok(!code.includes('_port'));
+});
+
+test('identity collision is said, never an exit (R4-1: any relay token holder can cause one)', () => {
+  const serverPath = resolveServerJs();
+  const code = fs.readFileSync(serverPath, 'utf8');
+  assert.ok(code.includes("h.on('identity-collision', (info) => relayStops.onStop(info));"), 'identity-collision handler missing');
+  assert.ok(!code.includes('process.exit(2)'), 'the server must not exit on an identity collision');
+});
+
+// ── 6. Installer: project-scoped mode (--project flag) ─────
+
+async function runProjectInstallTests() {
+  console.log('\nInstaller - project-scoped mode:');
+
+  await testAsync('--project writes .mcp.json and settings.local.json at cwd', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-proj-'));
+    try {
+      const { code } = await spawnInstaller(['init', '--project'], {
+        cwd: tmpDir,
+        env: { ...process.env, SYM_NODE_NAME: 'claude-test-project' },
+      });
+      assert.strictEqual(code, 0, 'installer should exit 0');
+
+      const mcpJson = JSON.parse(fs.readFileSync(path.join(tmpDir, '.mcp.json'), 'utf8'));
+      assert.ok(mcpJson.mcpServers, 'mcpServers missing');
+      const entry = mcpJson.mcpServers['claude-sym-mesh'];
+      assert.ok(entry, 'claude-sym-mesh missing from .mcp.json');
+      assert.strictEqual(entry.command, 'node');
+      assert.strictEqual(entry.env.SYM_NODE_NAME, 'claude-test-project');
+      assert.strictEqual(entry.env.SYM_RELAY_URL, '', 'relay url must be explicitly blank');
+      assert.strictEqual(entry.env.SYM_RELAY_TOKEN, '', 'relay token must be explicitly blank');
+
+      const settings = JSON.parse(fs.readFileSync(path.join(tmpDir, '.claude', 'settings.local.json'), 'utf8'));
+      assert.deepStrictEqual(settings.enabledMcpjsonServers, ['claude-sym-mesh']);
+      assert.strictEqual(settings.enableAllProjectMcpServers, true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('--project preserves existing settings.local.json keys', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-proj-'));
+    try {
+      fs.mkdirSync(path.join(tmpDir, '.claude'));
+      const existing = {
+        permissions: { allow: ['Read(//*)'] },
+        customKey: 42,
+      };
+      fs.writeFileSync(
+        path.join(tmpDir, '.claude', 'settings.local.json'),
+        JSON.stringify(existing),
+      );
+
+      const { code } = await spawnInstaller(['init', '--project'], { cwd: tmpDir });
+      assert.strictEqual(code, 0);
+
+      const settings = JSON.parse(fs.readFileSync(path.join(tmpDir, '.claude', 'settings.local.json'), 'utf8'));
+      assert.deepStrictEqual(settings.permissions, existing.permissions, 'permissions should be preserved');
+      assert.strictEqual(settings.customKey, 42, 'customKey should be preserved');
+      assert.deepStrictEqual(settings.enabledMcpjsonServers, ['claude-sym-mesh']);
+      assert.strictEqual(settings.enableAllProjectMcpServers, true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('--project refuses re-install without --force (exit 2)', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-proj-'));
+    try {
+      const first = await spawnInstaller(['init', '--project'], { cwd: tmpDir });
+      assert.strictEqual(first.code, 0, 'first install should succeed');
+
+      const second = await spawnInstaller(['init', '--project'], {
+        cwd: tmpDir,
+        allowFail: true,
+      });
+      assert.strictEqual(second.code, 2, 'second install without --force should exit 2');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('--project --force overwrites and creates a .mcp.json backup', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-proj-'));
+    try {
+      await spawnInstaller(['init', '--project'], { cwd: tmpDir });
+      const { code } = await spawnInstaller(['init', '--project', '--force'], { cwd: tmpDir });
+      assert.strictEqual(code, 0);
+
+      const backups = fs.readdirSync(tmpDir).filter((f) => f.startsWith('.mcp.json.bak-'));
+      assert.ok(backups.length > 0, 'backup file should exist after --force overwrite');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('global: heals stale top-level entry without --force, preserves SYM_NODE_NAME', async () => {
+    // Root cause of the "silent broken install" UX bug: prior npm install -g
+    // left ~/.claude.json pointing at a server.js path that no longer exists
+    // (repo moved/renamed/deleted). Subsequent reinstalls silently skipped the
+    // broken entry — users saw npm say "added 148 packages" then /mcp report
+    // "Failed to reconnect" with no explanation. Installer now classifies
+    // entries whose args[0] is missing on disk as STALE and rewrites them
+    // even without --force, preserving SYM_NODE_NAME.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+    try {
+      const claudeJsonPath = path.join(fakeHome, '.claude.json');
+      fs.writeFileSync(claudeJsonPath, JSON.stringify({
+        mcpServers: {
+          'claude-sym-mesh': {
+            command: 'node',
+            args: ['/nonexistent/stale/path/server.js'],
+            env: { SYM_NODE_NAME: 'claude-canonical', SYM_RELAY_URL: '', SYM_RELAY_TOKEN: '' },
+          },
+        },
+      }));
+      const { code } = await spawnInstaller(['init'], {
+        env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome },
+      });
+      assert.strictEqual(code, 0, 'installer should heal stale entry without --force');
+      const after = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+      const entry = after.mcpServers['claude-sym-mesh'];
+      assert.ok(fs.existsSync(entry.args[0]), 'rewritten path must exist on disk');
+      assert.strictEqual(entry.env.SYM_NODE_NAME, 'claude-canonical', 'node name must be preserved from the stale entry, not reset to the hostname default');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('global: refuses to overwrite a LIVE entry without --force', async () => {
+    // Regression guard for stale-heal feature. The stale-path rewrite must
+    // not accidentally stomp on an entry whose server.js is reachable.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+    try {
+      const claudeJsonPath = path.join(fakeHome, '.claude.json');
+      const liveServerPath = path.join(__dirname, '..', 'server.js');
+      assert.ok(fs.existsSync(liveServerPath), 'sanity: repo server.js must exist');
+      fs.writeFileSync(claudeJsonPath, JSON.stringify({
+        mcpServers: {
+          'claude-sym-mesh': {
+            command: 'node',
+            args: [liveServerPath],
+            env: { SYM_NODE_NAME: 'claude-live', SYM_RELAY_URL: '', SYM_RELAY_TOKEN: '' },
+          },
+        },
+      }));
+      const { code } = await spawnInstaller(['init'], {
+        env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome },
+        allowFail: true,
+      });
+      assert.strictEqual(code, 2, 'installer must exit 2 for a live entry without --force');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('global: postinstall silently heals stale entry (no "already configured" skip)', async () => {
+    // Before the fix, postinstall printed "already configured (skipping)" and
+    // exited 0 even when the existing entry pointed at a dead path. Users ran
+    // `npm install -g @sym-bot/mesh-channel`, postinstall "succeeded", and
+    // the MCP server was still unreachable. This test pins the new behaviour:
+    // stale entry on postinstall triggers a rewrite, not a skip.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+    try {
+      const claudeJsonPath = path.join(fakeHome, '.claude.json');
+      fs.writeFileSync(claudeJsonPath, JSON.stringify({
+        mcpServers: {
+          'claude-sym-mesh': {
+            command: 'node',
+            args: ['/nonexistent/path/server.js'],
+            env: { SYM_NODE_NAME: 'claude-preserved' },
+          },
+        },
+      }));
+      const { code } = await spawnInstaller(['init', '--postinstall'], {
+        env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome },
+      });
+      assert.strictEqual(code, 0);
+      const after = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+      assert.ok(fs.existsSync(after.mcpServers['claude-sym-mesh'].args[0]), 'postinstall must heal stale path, not skip');
+      assert.strictEqual(after.mcpServers['claude-sym-mesh'].env.SYM_NODE_NAME, 'claude-preserved');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('global: heals stale project-scoped entries under claudeJson.projects', async () => {
+    // Project-scoped mcpServers entries under ~/.claude.json's `projects`
+    // key override the user-global entry when Claude Code is launched from
+    // that directory. A stale project entry silently shadows a fresh
+    // user-global heal — the exact bug seen on 2026-04-23 where
+    // `~/code` was moved from `~/Documents/dev`. The installer now scans
+    // every project and rewrites stale claude-sym-mesh args, preserving
+    // each project's SYM_NODE_NAME.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+    try {
+      const claudeJsonPath = path.join(fakeHome, '.claude.json');
+      const liveServerPath = path.join(__dirname, '..', 'server.js');
+      fs.writeFileSync(claudeJsonPath, JSON.stringify({
+        mcpServers: {
+          'claude-sym-mesh': {
+            command: 'node',
+            args: ['/nonexistent/stale/server.js'],
+            env: { SYM_NODE_NAME: 'claude-top' },
+          },
+        },
+        projects: {
+          '/some/project/a': {
+            mcpServers: {
+              'claude-sym-mesh': {
+                command: 'node',
+                args: ['/also/stale/server.js'],
+                env: { SYM_NODE_NAME: 'claude-proj-a' },
+              },
+            },
+          },
+          '/some/project/b': {
+            mcpServers: {
+              'claude-sym-mesh': {
+                command: 'node',
+                args: [liveServerPath],
+                env: { SYM_NODE_NAME: 'claude-proj-b' },
+              },
+            },
+          },
+        },
+      }));
+      const { code } = await spawnInstaller(['init'], {
+        env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome },
+      });
+      assert.strictEqual(code, 0);
+      const after = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+      const projA = after.projects['/some/project/a'].mcpServers['claude-sym-mesh'];
+      const projB = after.projects['/some/project/b'].mcpServers['claude-sym-mesh'];
+      assert.ok(fs.existsSync(projA.args[0]), 'stale project-scoped entry must be healed');
+      assert.strictEqual(projA.env.SYM_NODE_NAME, 'claude-proj-a', 'stale project entry must preserve its SYM_NODE_NAME');
+      assert.strictEqual(projB.args[0], liveServerPath, 'live project-scoped entry must be left alone');
+      assert.strictEqual(projB.env.SYM_NODE_NAME, 'claude-proj-b');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('global: doctor reports live + stale entries without writing', async () => {
+    // Diagnostic subcommand for users with broken /mcp. Must be read-only.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+    try {
+      const claudeJsonPath = path.join(fakeHome, '.claude.json');
+      const before = {
+        mcpServers: {
+          'claude-sym-mesh': {
+            command: 'node',
+            args: ['/nonexistent/server.js'],
+            env: { SYM_NODE_NAME: 'claude-diag' },
+          },
+        },
+      };
+      fs.writeFileSync(claudeJsonPath, JSON.stringify(before));
+      const beforeBytes = fs.readFileSync(claudeJsonPath);
+      const { code, stdout } = await spawnInstallerCapture(['doctor'], {
+        env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome },
+      });
+      assert.strictEqual(code, 0);
+      assert.ok(stdout.includes('STALE'), 'doctor must flag the stale entry');
+      assert.ok(stdout.includes('user-global'), 'doctor must label the user-global scope');
+      const afterBytes = fs.readFileSync(claudeJsonPath);
+      assert.ok(beforeBytes.equals(afterBytes), 'doctor must be read-only');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('--project --room <name> persists SYM_ROOM into .mcp.json env', async () => {
+    // SYM_ROOM must be first-class at install time so a teammate's room
+    // membership survives Claude Code restarts. Pre-0.3.4, the only way to
+    // persist a room was to hand-edit ~/.claude.json after running
+    // sym_join_room at runtime — which the README never told users to do.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-proj-'));
+    try {
+      const { code } = await spawnInstaller(['init', '--project', '--room', 'backend-team'], {
+        cwd: tmpDir,
+        env: { ...process.env, SYM_NODE_NAME: 'claude-test-grp' },
+      });
+      assert.strictEqual(code, 0);
+      const mcp = JSON.parse(fs.readFileSync(path.join(tmpDir, '.mcp.json'), 'utf8'));
+      assert.strictEqual(mcp.mcpServers['claude-sym-mesh'].env.SYM_ROOM, 'backend-team');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('--project --room takes every MMP §5.8 room: dotted, underscored, and the tenant-suffixed one', async () => {
+    // The kebab-case grammar refused these; a node in them is valid (sym 0.14), so the installer must persist them.
+    for (const room of ['acme.prod', 'team_x', 'x-review--team-02779b950c3d8d7378fd11d6']) {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-proj-'));
+      try {
+        const { code } = await spawnInstaller(['init', '--project', '--room', room], { cwd: tmpDir, env: { ...process.env, SYM_NODE_NAME: 'claude-test-grp', SYM_ROOM: '' } });
+        assert.strictEqual(code, 0, room);
+        const mcp = JSON.parse(fs.readFileSync(path.join(tmpDir, '.mcp.json'), 'utf8'));
+        assert.strictEqual(mcp.mcpServers['claude-sym-mesh'].env.SYM_ROOM, room);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  await testAsync('--project without --room omits SYM_ROOM (default mesh)', async () => {
+    // Omitting SYM_ROOM from the env block (rather than writing an empty
+    // value) lets the server.js fallback select the global _sym._tcp mesh.
+    // An empty SYM_ROOM would shadow the fallback and pin the node to a
+    // nameless service type — silent failure mode.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-proj-'));
+    try {
+      const { code } = await spawnInstaller(['init', '--project'], {
+        cwd: tmpDir,
+        env: { ...process.env, SYM_NODE_NAME: 'claude-no-grp' },
+      });
+      assert.strictEqual(code, 0);
+      const mcp = JSON.parse(fs.readFileSync(path.join(tmpDir, '.mcp.json'), 'utf8'));
+      const env = mcp.mcpServers['claude-sym-mesh'].env;
+      assert.ok(!('SYM_ROOM' in env), 'SYM_ROOM must be omitted when not requested');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('global: heal preserves SYM_ROOM across stale-entry rewrite', async () => {
+    // The 2026-05-02 SYM.BOT incident root cause: pre-0.3.4 healing dropped
+    // SYM_ROOM silently, reverting the node to default mesh on next launch
+    // and stranding teammates who stayed in the named room. The fix copies
+    // both SYM_NODE_NAME and SYM_ROOM from the prior entry into the rewrite.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+    try {
+      const claudeJsonPath = path.join(fakeHome, '.claude.json');
+      fs.writeFileSync(claudeJsonPath, JSON.stringify({
+        mcpServers: {
+          'claude-sym-mesh': {
+            command: 'node',
+            args: ['/nonexistent/stale/server.js'],
+            env: {
+              SYM_NODE_NAME: 'claude-team-member',
+              SYM_ROOM: 'sym-bot-team',
+              SYM_RELAY_URL: '',
+              SYM_RELAY_TOKEN: '',
+            },
+          },
+        },
+      }));
+      const { code } = await spawnInstaller(['init'], {
+        env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome },
+      });
+      assert.strictEqual(code, 0);
+      const after = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+      const env = after.mcpServers['claude-sym-mesh'].env;
+      assert.strictEqual(env.SYM_NODE_NAME, 'claude-team-member', 'node name must be preserved');
+      assert.strictEqual(env.SYM_ROOM, 'sym-bot-team', 'room must be preserved on heal');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('global: --force --room <name> overrides preserved SYM_ROOM', async () => {
+    // CTO PR review note 1: --force is the "I am explicitly overriding state"
+    // signal. With --force, an explicit --room should win over the preserved
+    // value so users can switch rooms in a single command. Without --force,
+    // preserve still wins (heal path must not lose state) — covered by the
+    // separate stale-heal test above.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+    try {
+      const claudeJsonPath = path.join(fakeHome, '.claude.json');
+      const liveServerPath = path.join(__dirname, '..', 'server.js');
+      fs.writeFileSync(claudeJsonPath, JSON.stringify({
+        mcpServers: {
+          'claude-sym-mesh': {
+            command: 'node',
+            args: [liveServerPath],
+            env: {
+              SYM_NODE_NAME: 'claude-mover',
+              SYM_ROOM: 'old-team',
+              SYM_RELAY_URL: '',
+              SYM_RELAY_TOKEN: '',
+            },
+          },
+        },
+      }));
+      const { code } = await spawnInstaller(['init', '--force', '--room', 'new-team'], {
+        env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome },
+      });
+      assert.strictEqual(code, 0);
+      const after = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'));
+      assert.strictEqual(after.mcpServers['claude-sym-mesh'].env.SYM_ROOM, 'new-team',
+        '--force + explicit --room must override preserved SYM_ROOM (one-command switch)');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('global: --force --room default reverts to global mesh (omits SYM_ROOM)', async () => {
+    // The escape hatch documented in the README. `--room default` must
+    // remove the persisted SYM_ROOM entirely (not write the literal string
+    // "default" into the env block, which would map to a `_default._tcp`
+    // service type). Equivalent: revert to `_sym._tcp` global mesh.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+    try {
+      const claudeJsonPath = path.join(fakeHome, '.claude.json');
+      const liveServerPath = path.join(__dirname, '..', 'server.js');
+      fs.writeFileSync(claudeJsonPath, JSON.stringify({
+        mcpServers: {
+          'claude-sym-mesh': {
+            command: 'node',
+            args: [liveServerPath],
+            env: { SYM_NODE_NAME: 'claude-r', SYM_ROOM: 'team-x' },
+          },
+        },
+      }));
+      const { code } = await spawnInstaller(['init', '--force', '--room', 'default'], {
+        env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome },
+      });
+      assert.strictEqual(code, 0);
+      const env = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'))
+        .mcpServers['claude-sym-mesh'].env;
+      assert.ok(!('SYM_ROOM' in env), '--force --room default must omit SYM_ROOM entirely');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('init rejects malformed SYM_ROOM env var with the MMP §5.8 room error', async () => {
+    // CTO PR review note 2: the room gate must apply to the SYM_ROOM env var, not just the --room CLI
+    // flag. Pre-fix, SYM_ROOM=Backend_Team flowed through unvalidated and got written into the entry
+    // as-is, for a node that refuses it (sym 0.14 throws EBADROOM; a room is [a-z0-9._-], 1 to 64).
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-proj-'));
+    try {
+      for (const bad of ['Backend_Team', 'sym', 'has space', 'a'.repeat(65)]) {
+        const { code, stderr } = await spawnInstaller(['init', '--project'], {
+          cwd: tmpDir,
+          env: { ...process.env, SYM_ROOM: bad },
+          allowFail: true,
+        });
+        assert.strictEqual(code, 1, `malformed SYM_ROOM ${JSON.stringify(bad.slice(0, 12))} must exit 1`);
+        assert.ok(stderr.includes('SYM_ROOM'), 'error must name the env var, not just --room');
+        assert.ok(stderr.includes('MMP §5.8') && stderr.includes('1 to 64 characters'), 'error must explain the constraint');
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // `start --room` must reach the plugin node too. The plugin's .mcp.json has
+  // no SYM_ROOM, so with only the server: entry carrying the room, a session
+  // ran one node in the named room and its plugin sibling in `default`.
+  // The folder IS the agent: `sym-agent-x` runs as `claude-sym-agent-x` (decision 2026-10-01).
+  const expectedFolderName = (dir) => `claude-${path.basename(dir).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '')}`;
+
+  // Returns the installer's result plus the fake home's ~/.claude.json and its backups afterwards.
+  async function runStart(startArgs, tmpDir, { claudeJson = {}, allowFail = false, home = null } = {}) {
+    const fakeHome = home || fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-bin-'));
+    try {
+      if (!home || !fs.existsSync(path.join(fakeHome, '.claude.json'))) fs.writeFileSync(path.join(fakeHome, '.claude.json'), JSON.stringify(claudeJson));
+      fs.writeFileSync(path.join(binDir, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      const r = await spawnInstallerCapture(['start', ...startArgs], {
+        cwd: tmpDir,
+        env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome, PATH: `${binDir}${path.delimiter}${process.env.PATH}` },
+        allowFail,
+      });
+      r.claudeJson = JSON.parse(fs.readFileSync(path.join(fakeHome, '.claude.json'), 'utf8'));
+      r.backups = fs.readdirSync(fakeHome).filter((f) => f.startsWith('.claude.json.bak-'));
+      return r;
+    } finally {
+      if (!home) fs.rmSync(fakeHome, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  }
+
+  if (process.platform !== 'win32') {
+    await testAsync('start writes a user-scope entry that pins no name or room (every folder reads it)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        const { code, claudeJson } = await runStart(['--room', 'team-x'], tmpDir);
+        assert.strictEqual(code, 0);
+        const env = claudeJson.mcpServers['claude-sym-mesh'].env;
+        assert.ok(!('SYM_NODE_NAME' in env), `no global name: ${JSON.stringify(env)}`);
+        assert.ok(!('SYM_ROOM' in env), `no global room: ${JSON.stringify(env)}`);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('start removes a global name pin left by an older install, with a backup', async () => {
+      // The 2026-10-01 failure: SYM_NODE_NAME=claude-<hostname> in ~/.claude.json gave every
+      // folder one identity, so the second concurrent session's server died on the identity lock.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        const live = path.join(__dirname, '..', 'server.js');
+        const { code, claudeJson, backups, stdout } = await runStart([], tmpDir, {
+          claudeJson: { mcpServers: { 'claude-sym-mesh': { command: 'node', args: [live], env: {
+            SYM_NODE_NAME: 'claude-old-host', SYM_ROOM: 'old-room',
+            SYM_RELAY_URL: 'wss://relay.example', SYM_RELAY_TOKEN: 'tok-123',
+          } } } },
+        });
+        assert.strictEqual(code, 0);
+        const env = claudeJson.mcpServers['claude-sym-mesh'].env;
+        assert.ok(!('SYM_NODE_NAME' in env) && !('SYM_ROOM' in env), `pins removed: ${JSON.stringify(env)}`);
+        assert.ok(backups.length >= 1, 'the old ~/.claude.json is backed up first');
+        assert.ok(stdout.includes('for EVERY folder'), 'the rewrite says why');
+        // The folder gets its OWN name, not the machine-wide pin (it is the agent), keeps the room, and
+        // is told how to keep the old identity if it wants it.
+        const cfg = JSON.parse(fs.readFileSync(path.join(tmpDir, '.sym', 'node.json'), 'utf8'));
+        assert.deepStrictEqual(cfg, { node_name: expectedFolderName(tmpDir), room: 'old-room' });
+        assert.ok(stdout.includes('sym-mesh-channel start --name claude-old-host'), stdout);
+        // …and removing a name pin does not take the seat off its relay.
+        assert.strictEqual(env.SYM_RELAY_URL, 'wss://relay.example');
+        assert.strictEqual(env.SYM_RELAY_TOKEN, 'tok-123');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('every folder that shared a removed machine-wide name is told, not only the first (final review F3)', async () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+      const x = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      const y = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        const live = path.join(__dirname, '..', 'server.js');
+        fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ mcpServers: { 'claude-sym-mesh': { command: 'node', args: [live], env: { SYM_NODE_NAME: 'claude-xmesh-hp' } } } }));
+        const first = await runStart([], x, { home });
+        assert.ok(first.stdout.includes('start --name claude-xmesh-hp'), first.stdout);
+        const second = await runStart([], y, { home });   // the global pin is already gone by now
+        assert.ok(second.stdout.includes('start --name claude-xmesh-hp'), `the second folder is told too: ${second.stdout}`);
+        const third = await runStart([], y, { home });    // same folder again: it already has its name
+        assert.ok(!third.stdout.includes('start --name claude-xmesh-hp'), 'told once per folder, when it gets its name');
+      } finally {
+        for (const d of [home, x, y]) fs.rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('a plugin enabled only at project scope is turned off under its own key (final review F11)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        fs.mkdirSync(path.join(tmpDir, '.claude'));
+        fs.writeFileSync(path.join(tmpDir, '.claude', 'settings.json'), JSON.stringify({ enabledPlugins: { 'sym-mesh-channel@other-market': true } }));
+        await runStart([], tmpDir);
+        const st = JSON.parse(fs.readFileSync(path.join(tmpDir, '.claude', 'settings.local.json'), 'utf8'));
+        assert.strictEqual(st.enabledPlugins['sym-mesh-channel@other-market'], false, JSON.stringify(st));
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('run from npx, start writes a versioned npx launch spec, not a path into npx\'s cache (0.10.1)', async () => {
+      // Lay the package out the way npx does: …/_npx/<hash>/node_modules/@sym-bot/mesh-channel/.
+      const npxRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-npx-'));
+      const pkgDir = path.join(npxRoot, '_npx', 'abc123', 'node_modules', '@sym-bot', 'mesh-channel');
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+      const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-bin-'));
+      try {
+        fs.mkdirSync(path.join(pkgDir, 'bin'), { recursive: true });
+        // every root module the package ships (its `files` list), not a fixed few: install.js requires ../claude-bin.js,
+        // server.js requires the rest, and a list written here goes stale the next time a module is added (0.11.1 review B1)
+        const shipped = require('../package.json').files.filter((f) => /^[A-Za-z0-9._-]+\.js$/.test(f));
+        for (const f of ['package.json', ...shipped]) fs.copyFileSync(path.join(__dirname, '..', f), path.join(pkgDir, f));
+        fs.copyFileSync(path.join(__dirname, '..', 'bin', 'install.js'), path.join(pkgDir, 'bin', 'install.js'));
+        fs.writeFileSync(path.join(home, '.claude.json'), '{}');
+        fs.writeFileSync(path.join(binDir, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+        const r = require('child_process').spawnSync(process.execPath, [path.join(pkgDir, 'bin', 'install.js'), 'start', '--room', 'team-x'], {
+          cwd: tmpDir, encoding: 'utf8',
+          env: { ...process.env, HOME: home, USERPROFILE: home, PATH: `${binDir}${path.delimiter}${process.env.PATH}` },
+        });
+        assert.strictEqual(r.status, 0, r.stderr);
+        const entry = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8')).mcpServers['claude-sym-mesh'];
+        const version = require('../package.json').version;
+        // Native Windows runs npx through cmd /c; elsewhere npx is called directly (review F4).
+        const want = process.platform === 'win32'
+          ? { command: 'cmd', args: ['/c', 'npx', '-y', `@sym-bot/mesh-channel@${version}`] }
+          : { command: 'npx', args: ['-y', `@sym-bot/mesh-channel@${version}`] };
+        assert.strictEqual(entry.command, want.command, JSON.stringify(entry));
+        assert.deepStrictEqual(entry.args, want.args);
+      } finally {
+        for (const d of [npxRoot, tmpDir, home, binDir]) fs.rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('pins order by semver, prereleases included: rc.9 < rc.10 < release (re-review F6)', async () => {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'install.js'), 'utf8');
+      const fnSrc = src.match(/const versionLess = [\s\S]*?\n};/)[0].replace('const versionLess = ', '').replace(/;\s*$/, '');
+      const versionLess = eval(`(${fnSrc})`);
+      for (const [a, b] of [['0.11.0-rc.9', '0.11.0-rc.10'], ['0.11.0-rc.10', '0.11.0'], ['0.10.9', '0.10.10'], ['0.11.0-alpha', '0.11.0-beta'], ['0.11.0-1', '0.11.0-alpha']]) {
+        assert.ok(versionLess(a, b) && !versionLess(b, a), `${a} < ${b}`);
+      }
+      assert.ok(!versionLess('0.10.1', '0.10.1'));
+    });
+
+    await testAsync('init heals a stale project entry while leaving a current top entry alone, and says so (re-review F1, F9)', async () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+      try {
+        const live = path.join(__dirname, '..', 'server.js');
+        fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({
+          mcpServers: { 'claude-sym-mesh': { command: 'node', args: [live], env: { SYM_RELAY_URL: '', SYM_RELAY_TOKEN: '' } } },
+          projects: { '/some/project': { mcpServers: { 'claude-sym-mesh': { command: 'node', args: ['/gone/server.js'], env: { SYM_NODE_NAME: 'claude-proj' } } } } },
+        }));
+        const r = await spawnInstallerCapture(['init'], { env: { ...process.env, HOME: home, USERPROFILE: home } });
+        assert.strictEqual(r.code, 0, r.stderr);
+        assert.ok(r.stdout.includes('is current and was left as is'), r.stdout);
+        assert.ok(!r.stdout.includes('configured globally'), 'no banner for a write that did not happen');
+        const j = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'));
+        assert.deepStrictEqual(j.mcpServers['claude-sym-mesh'].args, [live], 'top entry untouched');
+        assert.notStrictEqual(j.projects['/some/project'].mcpServers['claude-sym-mesh'].args[0], '/gone/server.js', 'project entry healed');
+        assert.strictEqual(j.projects['/some/project'].mcpServers['claude-sym-mesh'].env.SYM_NODE_NAME, 'claude-proj');
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('removing old name pins never downgrades a newer launch pin (re-review F5)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        const r = await runStart([], tmpDir, { claudeJson: { mcpServers: { 'claude-sym-mesh': { command: 'npx', args: ['-y', '@sym-bot/mesh-channel@99.0.0'], env: { SYM_NODE_NAME: 'claude-old' } } } } });
+        const e = r.claudeJson.mcpServers['claude-sym-mesh'];
+        assert.ok(!('SYM_NODE_NAME' in e.env), 'the name pin is removed');
+        assert.deepStrictEqual(e.args, ['-y', '@sym-bot/mesh-channel@99.0.0'], 'the newer launch pin is kept');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('start says so when the entry pins a version newer than itself (review F3)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        const r = await runStart([], tmpDir, { claudeJson: { mcpServers: { 'claude-sym-mesh': { command: 'npx', args: ['-y', '@sym-bot/mesh-channel@99.0.0'], env: {} } } } });
+        assert.ok(/pins @sym-bot\/mesh-channel@99\.0\.0, newer than this installer/.test(r.stderr), r.stderr);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('an npx spec pinning an older version is upgraded by start; a newer one is never downgraded (0.10.1)', async () => {
+      const older = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      const newer = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        const a = await runStart([], older, { claudeJson: { mcpServers: { 'claude-sym-mesh': { command: 'npx', args: ['-y', '@sym-bot/mesh-channel@0.0.1'], env: {} } } } });
+        assert.notDeepStrictEqual(a.claudeJson.mcpServers['claude-sym-mesh'].args, ['-y', '@sym-bot/mesh-channel@0.0.1'], 'an older pin is rewritten');
+        const b = await runStart([], newer, { claudeJson: { mcpServers: { 'claude-sym-mesh': { command: 'npx', args: ['-y', '@sym-bot/mesh-channel@99.0.0'], env: {} } } } });
+        assert.deepStrictEqual(b.claudeJson.mcpServers['claude-sym-mesh'].args, ['-y', '@sym-bot/mesh-channel@99.0.0'], 'a newer pin is left alone');
+      } finally {
+        for (const d of [older, newer]) fs.rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('start turns the plugin off for its folder, keeping the settings already there (one agent, one node)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        fs.mkdirSync(path.join(tmpDir, '.claude'));
+        const file = path.join(tmpDir, '.claude', 'settings.local.json');
+        fs.writeFileSync(file, JSON.stringify({ permissions: { allow: ['Bash(ls)'] }, enabledPlugins: { 'other@x': true } }));
+        const { code, stdout } = await runStart(['--room', 'team-x'], tmpDir);
+        assert.strictEqual(code, 0);
+        const st = JSON.parse(fs.readFileSync(file, 'utf8'));
+        assert.strictEqual(st.enabledPlugins['sym-mesh-channel@sym-bot'], false);
+        assert.strictEqual(st.enabledPlugins['other@x'], true, 'other plugins untouched');
+        assert.deepStrictEqual(st.permissions, { allow: ['Bash(ls)'] }, 'other keys kept');
+        assert.ok(fs.readdirSync(path.join(tmpDir, '.claude')).some((f) => f.startsWith('settings.local.json.bak-')), 'backed up first');
+        assert.ok(stdout.includes('plugin is off for this folder'), stdout);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('start warns when a project-scope entry in ~/.claude.json still pins this folder (re-review F10)', async () => {
+      const tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-')));
+      try {
+        const live = path.join(__dirname, '..', 'server.js');
+        const { code, stderr } = await runStart([], tmpDir, {
+          claudeJson: { projects: { [tmpDir]: { mcpServers: { 'claude-sym-mesh': { command: 'node', args: [live], env: { SYM_NODE_NAME: 'claude-old-host' } } } } } },
+        });
+        assert.strictEqual(code, 0);
+        assert.ok(stderr.includes('project-scope') && stderr.includes('SYM_NODE_NAME=claude-old-host') && stderr.includes('claude mcp remove claude-sym-mesh -s local'), stderr);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('start replaces a node_name in .sym/node.json that breaks the naming rule (review F10)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        fs.mkdirSync(path.join(tmpDir, '.sym'));
+        const file = path.join(tmpDir, '.sym', 'node.json');
+        fs.writeFileSync(file, JSON.stringify({ node_name: '../../tmp/evil', room: 'team-x' }));
+        const { stderr } = await runStart([], tmpDir);
+        const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+        assert.ok(!cfg.node_name.includes('/'), JSON.stringify(cfg));
+        assert.strictEqual(cfg.room, 'team-x', 'the rest of the file is kept');
+        assert.ok(stderr.includes(`replaced with '${expectedFolderName(tmpDir)}'`), stderr);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('start --name refuses a name that would escape ~/.sym/nodes/ (MMP §3.1.2)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        const { code, stderr } = await runStart(['--name', '../evil'], tmpDir, { allowFail: true });
+        assert.strictEqual(code, 1);
+        assert.ok(stderr.includes('path separators'), stderr);
+        assert.ok(!fs.existsSync(path.join(tmpDir, '.sym', 'node.json')), 'nothing written');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('start --room writes the room to <cwd>/.sym/node.json for the plugin node', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        const { code } = await runStart(['--room', 'xmesh-world-room'], tmpDir);
+        assert.strictEqual(code, 0);
+        const cfg = JSON.parse(fs.readFileSync(path.join(tmpDir, '.sym', 'node.json'), 'utf8'));
+        // The folder's own stable name comes with it (one folder, one agent, one name).
+        assert.strictEqual(cfg.room, 'xmesh-world-room');
+        assert.strictEqual(cfg.node_name, expectedFolderName(tmpDir));
+        assert.ok(cfg.node_name.length <= 64 && !/--/.test(cfg.node_name) && !cfg.node_name.endsWith('-'), cfg.node_name);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('start --room keeps node_name in an existing node.json, --room default removes the room', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        fs.mkdirSync(path.join(tmpDir, '.sym'));
+        const file = path.join(tmpDir, '.sym', 'node.json');
+        fs.writeFileSync(file, JSON.stringify({ node_name: 'cto', room: 'old-team' }));
+        await runStart(['--room', 'new-team'], tmpDir);
+        assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { node_name: 'cto', room: 'new-team' });
+        await runStart(['--room', 'default'], tmpDir);
+        assert.deepStrictEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { node_name: 'cto' });
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('start --room leaves a malformed node.json untouched and says so', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        fs.mkdirSync(path.join(tmpDir, '.sym'));
+        const file = path.join(tmpDir, '.sym', 'node.json');
+        fs.writeFileSync(file, '{ not json');
+        const { code, stderr } = await runStart(['--room', 'new-team'], tmpDir);
+        assert.strictEqual(code, 0);
+        assert.strictEqual(fs.readFileSync(file, 'utf8'), '{ not json');
+        assert.ok(stderr.includes('left unchanged'), 'must name the file it did not rewrite');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    await testAsync('start without --room gives the folder a name and pins no room', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-start-'));
+      try {
+        await runStart([], tmpDir);
+        const cfg = JSON.parse(fs.readFileSync(path.join(tmpDir, '.sym', 'node.json'), 'utf8'));
+        assert.strictEqual(cfg.node_name, expectedFolderName(tmpDir), JSON.stringify(cfg));
+        assert.ok(!('room' in cfg), 'no room is pinned when none was asked for');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  await testAsync('global: doctor reports room per entry and warns on mismatch', async () => {
+    // doctor surfaces SYM_ROOM for every entry so users can spot the
+    // failure mode without first reading the troubleshooting section.
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+    try {
+      const claudeJsonPath = path.join(fakeHome, '.claude.json');
+      const liveServerPath = path.join(__dirname, '..', 'server.js');
+      fs.writeFileSync(claudeJsonPath, JSON.stringify({
+        mcpServers: {
+          'claude-sym-mesh': {
+            command: 'node',
+            args: [liveServerPath],
+            env: { SYM_NODE_NAME: 'claude-a', SYM_ROOM: 'team-x' },
+          },
+        },
+        projects: {
+          '/some/project': {
+            mcpServers: {
+              'claude-sym-mesh': {
+                command: 'node',
+                args: [liveServerPath],
+                env: { SYM_NODE_NAME: 'claude-b', SYM_ROOM: 'team-y' },
+              },
+            },
+          },
+        },
+      }));
+      const { code, stdout } = await spawnInstallerCapture(['doctor'], {
+        env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome },
+      });
+      assert.strictEqual(code, 0);
+      assert.ok(stdout.includes('room: team-x'), 'doctor must show team-x');
+      assert.ok(stdout.includes('room: team-y'), 'doctor must show team-y');
+      assert.ok(stdout.includes('Room mismatch'), 'doctor must flag mismatch across entries');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  await testAsync('--project + --postinstall falls back to global install (no .mcp.json written)', async () => {
+    // --postinstall always runs global (postinstall runs from npm staging
+    // dir, not the user's project). When paired with --project we want
+    // the project flag ignored, NOT an error — preserves existing
+    // postinstall auto-config behavior for npm install -g.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-proj-'));
+    try {
+      // Global install writes ~/.claude.json which we don't want to
+      // mutate in a test. Simulate absence: point HOME at a tmp dir that
+      // has no .claude.json, and expect postinstall-branch graceful skip.
+      const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'smc-home-'));
+      try {
+        const { code } = await spawnInstaller(['init', '--project', '--postinstall'], {
+          cwd: tmpDir,
+          env: { ...process.env, HOME: fakeHome, USERPROFILE: fakeHome },
+        });
+        // Postinstall skips gracefully (exit 0) when ~/.claude.json
+        // is missing, and must NOT have created <cwd>/.mcp.json.
+        assert.strictEqual(code, 0, 'postinstall should skip gracefully');
+        assert.ok(!fs.existsSync(path.join(tmpDir, '.mcp.json')),
+          '--project should be ignored during postinstall; no project files should be written');
+      } finally {
+        fs.rmSync(fakeHome, { recursive: true, force: true });
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+}
+
+function spawnInstaller(args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const installJs = path.join(__dirname, '..', 'bin', 'install.js');
+    const proc = spawn(process.execPath, [installJs, ...args], {
+      cwd: opts.cwd,
+      env: opts.env || process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    // Drain stdout to prevent buffer fill on long output
+    proc.stdout.on('data', () => {});
+    proc.on('close', (code) => {
+      if (code !== 0 && !opts.allowFail) {
+        return reject(new Error(`installer exited ${code}: ${stderr}`));
+      }
+      resolve({ code, stderr });
+    });
+    proc.on('error', reject);
+  });
+}
+
+// spawnInstallerCapture: variant that captures stdout for assertions.
+// Kept separate so the default `spawnInstaller` stays buffer-safe on
+// long output runs.
+function spawnInstallerCapture(args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const installJs = path.join(__dirname, '..', 'bin', 'install.js');
+    const proc = spawn(process.execPath, [installJs, ...args], {
+      cwd: opts.cwd,
+      env: opts.env || process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('close', (code) => {
+      if (code !== 0 && !opts.allowFail) {
+        return reject(new Error(`installer exited ${code}: ${stderr}`));
+      }
+      resolve({ code, stdout, stderr });
+    });
+    proc.on('error', reject);
+  });
+}
+
+// ── Invite URL parse + create round-trip (the SDK's grammar, sym 0.14) ──
+//
+// 0.10 kept a mirror of its own invite regex here. The grammar is now the SDK's (room-names.js asks
+// sym's `invite`), so these test the real thing, including the issuer an invite now carries.
+
+console.log('\nInvite URL — parse and round trip:');
+const { parseInviteURL } = require('../room-names.js');
+const { buildInvite } = require('@sym-bot/sym').invite;
+const ISSUER = { nodeId: '01a0fd15-52ca-726c-9ce1-5767a1379249', publicKey: 'AIFMY28eNJTXCDpjEPAwqpcORIiJt1ByDeaatkY_K-U' };
+
+test('sym://room/{name} parses to the room, and a room is not a service type', () => {
+  const p = parseInviteURL('sym://room/backend-team');
+  assert.strictEqual(p.room, 'backend-team');
+  assert.ok(!('serviceType' in p), 'nothing in this channel maps a room to `_<room>._tcp` (sym 0.14: _sym._tcp with TXT room)');
+  assert.strictEqual(p.issuer, null);
+  assert.strictEqual(parseInviteURL('sym://room/acme.prod').room, 'acme.prod', 'a dotted room is a room (MMP §5.8)');
+});
+
+test('sym://team/{name}?relay=&token= parses the relay credentials', () => {
+  const p = parseInviteURL('sym://team/eng-team?relay=wss%3A%2F%2Frelay.example.com&token=shared-secret-xyz');
+  assert.strictEqual(p.relayUrl, 'wss://relay.example.com');
+  assert.strictEqual(p.relayToken, 'shared-secret-xyz');
+});
+
+test('melotune://room/{id}/{name} prefixes the room with the app scheme', () => {
+  const p = parseInviteURL('melotune://room/abc123/Lounge');
+  assert.strictEqual(p.room, 'melotune-abc123');
+  assert.strictEqual(p.roomName, 'Lounge');
+});
+
+test('a non-invite string is refused with the expected shapes', () => {
+  assert.match(parseInviteURL('https://example.com').error, /Expected shapes/);
+  assert.ok(parseInviteURL('').error);
+});
+
+test('round trip: an invite built with an issuer parses back to the same room, relay and issuer', () => {
+  const url = buildInvite({ room: 'x-review--team-02779b950c3d8d7378fd11d6', relay: 'wss://r.example', token: 'tok', issuer: ISSUER });
+  const p = parseInviteURL(url);
+  assert.strictEqual(p.room, 'x-review--team-02779b950c3d8d7378fd11d6');
+  assert.strictEqual(p.relayUrl, 'wss://r.example');
+  assert.strictEqual(p.relayToken, 'tok');
+  assert.deepStrictEqual(p.issuer, ISSUER);
+});
+
+test('an issuer whose node or key is malformed makes the invite no invite', () => {
+  assert.match(parseInviteURL('sym://room/a?node=alice&key=x').error, /names an issuer/);
+});
+
+(async () => {
+  await runProjectInstallTests();
+  console.log(`\n${passed + failed} tests, ${passed} passed, ${failed} failed\n`);
+  process.exit(failed > 0 ? 1 : 0);
+})();
+
+// ── Helpers ─────────────────────────────────────────────────
+
+function loadManifest() {
+  const raw = fs.readFileSync(path.join(__dirname, '..', '.claude-plugin', 'plugin.json'), 'utf8');
+  return JSON.parse(raw);
+}
+
+function loadMcpJson() {
+  const raw = fs.readFileSync(path.join(__dirname, '..', '.mcp.json'), 'utf8');
+  return JSON.parse(raw);
+}
+
+function resolveServerJs() {
+  return path.join(__dirname, '..', 'server.js');
+}
+
+// ── Room grammar: one source, and the one permitted mirror cannot drift ──────
+//
+// A room is an MMP §5.8 identifier ([a-z0-9._-], 1 to 64 characters, and not `sym`), signed into every
+// record and the handshake, so a validator that disagrees with the SDK's by one character means two
+// nodes disagree about whether a room exists. That has happened in this repo three times: twice as a
+// kebab-case copy, and once more in relay-store.js, which kept its own pattern and refused every dotted
+// room a node may be in. Since sym 0.14 the SDK's `rooms.isValidRoom` is the grammar.
+//
+// The modules keep NO copy (they import it). bin/install.js keeps one last-resort mirror, because install
+// must still validate when the SDK is not resolvable. The mirror is read out of the SOURCE TEXT (install.js
+// runs its installer on require) and run against the SDK on a table of names.
+const ROOM_TABLE = [
+  'default', 'backend-team', 'acme.prod', 'team_x', 'a', 'x-review--team-02779b950c3d8d7378fd11d6', '-lead', 'x---y', '.', '..', '0',
+  'a'.repeat(64), 'a'.repeat(65), '', ' ', 'Backend', 'My Team', 'café', 'a/b', 'a\\b', 'sym', 'SYM', 'sym.', 'a\nb', 'ünï',
+];
+
+test('room grammar has one source, and install.js mirror matches the SDK on a table of names', () => {
+  const root = path.join(__dirname, '..');
+  for (const f of ['server.js', 'room-names.js', 'room-discovery.js', 'relay-store.js']) {
+    const src = fs.readFileSync(path.join(root, f), 'utf8').split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
+    assert.ok(!/\[a-z0-9\._-\]|\[a-z0-9\]\[a-z0-9-\]|KEBAB_CASE_RE/.test(src), `${f} must not declare a room pattern of its own — it asks the SDK`);
+    assert.ok(!/lib\/rooms\.js|core\/room-id/.test(src), `${f}: the room grammar comes from the SDK's rooms export, never a deep import`);
+  }
+  assert.ok(/= require\('@sym-bot\/sym'\)\.rooms;/.test(fs.readFileSync(path.join(root, 'relay-store.js'), 'utf8')), 'relay-store.js asks the SDK');
+  assert.ok(/= sdk\.rooms;/.test(fs.readFileSync(path.join(root, 'room-names.js'), 'utf8')), 'room-names.js asks the SDK');
+
+  const install = fs.readFileSync(path.join(root, 'bin', 'install.js'), 'utf8');
+  const mirror = install.match(/const\s+FALLBACK_ROOM_RE\s*=\s*(\/.+\/);/);
+  assert.ok(mirror, 'install.js must keep its mirror in a named FALLBACK_ constant');
+  const fallback = install.match(/const\s+fallbackIsRoom\s*=\s*\(v\)\s*=>\s*(.+);/);
+  assert.ok(fallback, 'install.js must keep the mirror\'s predicate');
+  const re = new Function(`return ${mirror[1]}`)();
+  const mirrorIsRoom = new Function('FALLBACK_ROOM_RE', `return (v) => ${fallback[1]}`)(re);
+
+  const { isValidRoom } = require('@sym-bot/sym').rooms;
+  for (const r of ROOM_TABLE) {
+    assert.strictEqual(mirrorIsRoom(r), isValidRoom(r), `install.js mirror and the SDK disagree about ${JSON.stringify(r.slice(0, 20))}`);
+  }
+  // What the table pins: the §5.8 grammar, not the kebab-case one.
+  assert.ok(isValidRoom('acme.prod') && isValidRoom('team_x') && isValidRoom('.') && isValidRoom('-lead') && isValidRoom('x---y'), '§5.8 admits dots, underscores and any hyphen placement');
+  assert.ok(isValidRoom('x-review--team-02779b950c3d8d7378fd11d6') && isValidRoom('a'.repeat(64)) && !isValidRoom('a'.repeat(65)));
+  assert.ok(!isValidRoom('Backend') && !isValidRoom('') && !isValidRoom('a b') && !isValidRoom('café'), 'uppercase, empty, spaces and non-ASCII are not rooms');
+});
+
+test('room names: `sym` is refused, and both gates (invite and join) use the one predicate', () => {
+  const root = path.join(__dirname, '..');
+  const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
+  const { isRoom } = require('../room-names.js');
+  assert.ok(!isRoom('sym'), '`sym` is the service every room is advertised under; the SDK refuses it');
+  assert.ok(isRoom('default') && isRoom('backend-team') && isRoom('acme.prod') && isRoom('x-review--team-02779b950c3d8d7378fd11d6'));
+  assert.ok(!isRoom('Bad_Room') && !isRoom(' backend') && !isRoom('') && !isRoom(null) && !isRoom(42));
+  assert.strictEqual((server.match(/if \(!isRoom\(room\)/g) || []).length, 2, 'both tool gates (invite and join) enforce isRoom');
+  assert.ok(/if \(!isRoom\(ROOM\)\)/.test(server), 'the configured room is checked before the node is built');
+});
+
+test('a refusal names the cause that applies', () => {
+  const { roomRefusalReason } = require('../room-names.js');
+  assert.match(roomRefusalReason('sym'), /"sym" is reserved/, '`sym` is grammatical; the cause is that it is reserved');
+  assert.match(roomRefusalReason('Bad_Room'), /1 to 64 characters from a-z, 0-9, "\.", "_" and "-", all lowercase \(MMP §5\.8\)/);
+  assert.match(roomRefusalReason('a'.repeat(65)), /at most 64 characters \(this one is 65\)/);
+  assert.match(roomRefusalReason(''), /cannot be empty/);
+  assert.ok(!/kebab/i.test(roomRefusalReason('Bad_Room')), 'the kebab-case grammar is gone');
+});
+
+test('this channel builds no per-room service type: the SDK advertises _sym._tcp with TXT room', () => {
+  const root = path.join(__dirname, '..');
+  const offenders = [];
+  for (const f of ['server.js', 'node-host.js', 'room-names.js', 'room-discovery.js', 'interior-host.js']) {
+    fs.readFileSync(path.join(root, f), 'utf8').split('\n').forEach((line, i) => {
+      if (/^\s*(\/\/|\*|\/\*)/.test(line)) return;
+      if (/roomServiceType|serviceTypeToRoom|discoveryServiceType|discoveryBrowseTypes|`_\$\{[A-Za-z]|serviceType/.test(line)) offenders.push(`${f}:${i + 1}: ${line.trim()}`);
+    });
+  }
+  assert.deepStrictEqual(offenders, [], 'a per-room type would make this node invisible to every 0.14 node, which browses only _sym._tcp');
+});

@@ -1,0 +1,577 @@
+<!-- Full technical reference. Start with ../README.md. -->
+
+# sym-mesh-channel
+
+## Let your Claude Code sessions talk while they work.
+
+Peer findings can enter another Claude Code conversation mid-turn through Claude Code Channels. Run sessions on one machine, across a LAN, or through an optional relay. Each session keeps its own context and decides what to do with the signal.
+
+```
+# In Claude Code
+/plugin marketplace add sym-bot/marketplace
+/plugin install sym-mesh-channel@sym-bot
+```
+
+> **Two things to know first.** Every session must join the same mesh room. Real-time `<channel>` push currently requires Claude Code's development-channels flag; the MCP tools work without it. The [quick start](#quick-start) handles that flag for the npm path.
+
+[![npm](https://img.shields.io/npm/v/@sym-bot/mesh-channel)](https://www.npmjs.com/package/@sym-bot/mesh-channel)
+[![Plugin Directory](https://img.shields.io/badge/Anthropic_Plugin_Directory-listed-success)](https://github.com/anthropics/claude-plugins-community)
+[![MMP Spec](https://img.shields.io/badge/protocol-MMP_v1.0-orange)](https://meshcognition.org/spec/mmp)
+[![SVAF arXiv](https://img.shields.io/badge/arXiv-2604.03955-b31b1b.svg)](https://arxiv.org/abs/2604.03955)
+[![MMP arXiv](https://img.shields.io/badge/arXiv-2604.19540-b31b1b.svg)](https://arxiv.org/abs/2604.19540)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org)
+[![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red)](README_zh.md)
+
+---
+
+## What it actually looks like
+
+Two Claude Code sessions on two machines used one mesh during a real crash fix. Both terminals are shown unedited:
+
+**🖥️ `melotune-dev`** finds the crash, prepares the fix, and asks the CTO session for review:
+
+![melotune-dev terminal — diagnoses the crash, prepares the fix, and requests review](img/mesh-dev-window.png)
+
+**🖥️ `claude-code-mac`** receives the finding mid-turn, reads the diff, checks the affected call sites, and returns its review:
+
+![claude-code-mac terminal — reviews the affected call sites and returns its assessment](img/mesh-cto-window.png)
+
+No one copied the finding between windows or manually selected the reviewing agent. The evidence here is the exchange itself: one Claude Code session surfaced work to another across the mesh.
+
+The current implementation supports multiple sessions on one machine, LAN discovery through mDNS (every node advertises on `_sym._tcp` with its room in the TXT `room` key), and optional relay transport across networks.
+
+> ⚠️ **The one prerequisite: same room.** Sessions only see each other when they're in the **same room** — their shared room. Get every session that should collaborate into one room *first*; then the exchange above just happens. On one wifi the default mesh already rooms co-located sessions, so they find each other automatically; for a private team room, point them all at one name — run `sym_join_room "your-team"` in each session. Sessions in *different* rooms are invisible to one another — that's the #1 "we're on the same wifi but my peer never shows up" gotcha. Full mechanics in [Team mesh rooms](#team-mesh-rooms).
+
+## Who this is for
+
+- **Solo developers running several Claude Code sessions on one machine** — one per repo or feature, or one planning while another codes. They coordinate over loopback (127.0.0.1) — no wifi, no second machine, one install covers every session on the box. The most common setup.
+- **Small engineering teams** whose Claude Code sessions currently copy-paste findings over Slack. Replace that loop with direct agent-to-agent coordination.
+- **Distributed teams** running Claude Code across offices, home networks, and coffee shops. Isolated team channels via mesh rooms, no shared server.
+- **Multi-agent developers** prototyping cognitive architectures — `sym-mesh-channel` is the reference Claude Code host for the [Mesh Memory Protocol](https://meshcognition.org/spec/mmp).
+- **Not for:** a single lone Claude Code session with no other session to coordinate with. You'd get the MCP tools but nothing to mesh with.
+
+## Where this sits — built on sym
+
+`sym-mesh-channel` (this package) is the Claude-Code-native surface — peer thoughts push into Claude's context in real-time. It's built on [`@sym-bot/sym`](https://github.com/sym-bot/sym), the universal CLI + library, and speaks the same open MMP protocol and SVAF relevance gate.
+
+```
+@sym-bot/mesh-channel   this package · Claude-Code-native · real-time push (<channel>)
+        ▼ depends on
+@sym-bot/sym            the CLI · any agent, any language · sym ask (pull)
+```
+
+They're **not alternatives** — the channel is built *on* sym and speaks the same protocol, identity, and SVAF relevance gate, so CLI agents and Claude sessions meet on the same mesh.
+
+This repository is a public developer surface. [MMP](https://meshcognition.org/spec/mmp) is the open wire protocol, [SYM](https://github.com/sym-bot/sym) is the open-core runtime, and [`xmesh-agent`](https://github.com/sym-bot/xmesh-agent) is a public open-source headless runtime. For enterprise AI integration, visit [xmesh.bot](https://xmesh.bot). The XMesh enterprise product and its codebase are private.
+
+**Which do you install?**
+
+- **Only using Claude Code, and want agents to coordinate in real-time?** → **this package** (`@sym-bot/mesh-channel`). It bundles sym's engine — nothing else to add.
+- **Other agents (Cursor, Copilot), scripts, any language — or you want the `sym ask` CLI in your terminal?** → [`@sym-bot/sym`](https://github.com/sym-bot/sym) + the skill file per agent.
+
+## Quick start
+
+**One command — it configures the mesh and launches Claude Code with real-time push already on:**
+
+```
+npx @sym-bot/mesh-channel@latest start
+```
+
+Run it in any repo, in as many terminals as you like — the sessions discover each other over loopback (or the same wifi) and **think together in real time**. No flag to remember, no `plugin:` vs `server:` to choose — `start` wires the channel for you. (First run configures the MCP server; after that it just launches. Co-resident sessions don't collide — each becomes its own peer.)
+
+Stand up a persistent **named** agent, or join a team room:
+
+```
+npx @sym-bot/mesh-channel@latest start --name cto --room my-team
+```
+
+(`start --print` shows the exact `claude …` command without launching; anything after `--` is passed straight to `claude`, e.g. `… start -- --resume`.)
+
+### Prefer the Claude Code plugin UI?
+
+Install the plugin and you get the 11 MCP tools immediately:
+
+```
+/plugin marketplace add sym-bot/marketplace
+/plugin install sym-mesh-channel@sym-bot
+```
+
+For real-time push on this path, launch with the channel flag (the handle must match where you installed from):
+
+```
+claude --dangerously-load-development-channels plugin:sym-mesh-channel@sym-bot
+```
+
+Also listed in the [Anthropic community directory](https://github.com/anthropics/claude-plugins-community) as `sym-mesh-channel@claude-community` — but that listing can lag behind releases, so install from `@sym-bot` above for the current build.
+
+> **The dev flag is temporary** — an Anthropic-side gate while the channel awaits the approved-channels allowlist ([anthropics/claude-plugins-official#1512](https://github.com/anthropics/claude-plugins-official/issues/1512)). `start` passes it under the hood today; once the channel is allowlisted it disappears. Curious when to use the npm/server install directly (named agents, repo-committed team config, the `sym` CLI)? See [Advanced](#advanced-named-agents-teams--the-cli).
+
+## What you get
+
+Fourteen MCP tools exposed to Claude Code, namespaced under `mcp__claude-sym-mesh__`:
+
+| Tool | What it does |
+|---|---|
+| `sym_send` | Send a CAT7 CMB to one peer (`to`: its nodeId, or a delivery id meaning that delivery's verified signer), or to the room if no recipient is given. `parents` cites what it answers (MMP §14.3). |
+| `sym_publish` | Publish a structured CAT7 CMB — a projection of your state — to your whole room: focus, issue, intent, motivation, commitment, perspective, mood, and optional `parents`. SVAF-gated on the receiving side. |
+| `sym_receive` | The deliveries since your last call, each with its verified signer, audience, relay, id and CMB key — a live delivery feed, not a store query. |
+| `sym_fetch` | A delivery in full by id: the whole verification account and the body, in parts when long. |
+| `sym_recall` | Search this node's memory (its own records, and peers' records verified when admitted). |
+| `sym_push_confirm` | State, first-hand, that this server's `<channel>` pushes reach you, with the code from a push check. |
+| `sym_peers` | Peers with a proven session: label and key fingerprint, nodeId, key source, sessions; and the outbox, stuck items included. |
+| `sym_status` | Node identity (nodeId, key fingerprint), the loaded `@sym-bot/mesh-channel` and `@sym-bot/sym` versions, room, relay state, Core Secure sessions and key conflicts, what sym's authority store says (anchor pinned or not, statements in force, this node's roles), deliveries that got no inbox id, memory, push statement, and the daemon-room advisory when it applies. |
+| `sym_room_info` | Report the mesh room this node is in, where that came from, how it is advertised on the LAN, and the peer roster scoped to the room. |
+| `sym_invite_create` | Generate an invite URL for a named room, naming this node as its issuer. LAN-only or cross-network flavour. |
+| `sym_invite_info` | Parse an invite URL: room, relay, and the issuer's nodeId and key fingerprint. |
+| `sym_join_room` | **Hot-swap** this node into a different mesh room at runtime, same identity; with `invite`, pin the issuer's key. |
+| `sym_rooms_discover` | List the rooms other SYM nodes are advertising on the local network now (`_sym._tcp`, TXT `room`), with how many nodes each has. Shows only a name that is a room; no node name or key. |
+| `sym_outbox_discard` | Discard what is held for a peer that is not coming back. |
+
+With the Channels flag enabled, real-time push is bidirectional: peer events arrive in Claude's context without any tool call, while the session is mid-turn. Without the flag, the same tools are available on demand — you just don't get the async push surface.
+
+**What a delivery line says.** `[alice ⟨…7f3a91c2⟩ →you] "review the migration" [in0042] key cmb-…` —
+the signer's own label and the shortest suffix of its key fingerprint that is unique among the keys
+this node knows (at least 8 hex; `alice (2 keys)` when two known keys use the label), `→you` for a
+CMB addressed to this node or `→room` for one bound to the room (admitted by this node's SVAF),
+`via label ⟨…⟩` when a relay session carried it, a quoted and escaped excerpt of the signed focus, the
+delivery id and the CMB key. A push carries the same line, and the facts as structured meta.
+`sym_fetch` gives the full nodeId and fingerprint (`sha256:<hex>`) and the signed text, fenced. A
+delivery whose own facts do not make it verified is listed by id and reason only, and one the
+content policy withholds names its category: `[in0042] from alice ⟨…⟩: withheld · injection-pattern
+— …`. A record whose wording may trip the model's own classifier is quarantined: its line says
+`classifier-risk (2 flagged terms)` and no text, and `sym_fetch` shows it on request. A mood frame
+carries no signed record: `[alice ⟨…⟩ mood, unsigned] "relieved" [m012]` is the word of the peer whose
+Core Secure session it came on, and there is nothing in it to cite.
+
+**The daemon in another room.** When the sym daemon on this machine is in a different room, the
+first tool answer of the session says so once (again only if the rooms change); `sym_status` always
+does. To answer it with lineage:
+`sym_send {"to": "in0042", "parents": ["in0042"], "focus": "…"}`.
+
+**Push, stated first-hand.** The server cannot see whether its notifications reach the model, so it
+sends one push check with a code. A session that received it calls `sym_push_confirm {"code": "…"}`;
+from then on `sym_receive` names a delivery it already pushed instead of repeating it. Until then,
+every delivery is listed.
+
+## Team mesh rooms
+
+By default every `sym-mesh-channel` node is in the room `default`, the global mesh. For a company with multiple teams, that's too noisy. A room (MMP §5.8) is a name the team shares, and `backend-team` and `frontend-team` nodes never dial each other.
+
+**A room is a name, not a service type.** With sym 0.14 (MMP 2.0 update 1, §5.1) every node advertises on one service type, `_sym._tcp`, with its room in the TXT `room` key and `mmp=2.0`. A node dials only an advertisement whose TXT room is its own and whose `mmp` list contains 2.0, and the handshake is what admits it. The channel builds no per-room service type (`_<room>._tcp`, the earlier mapping, is neither advertised nor browsed), so the room of an advertisement is whatever its TXT says, and `sym_rooms_discover` shows only names that are rooms.
+
+**A room name** is 1 to 64 characters from `a-z`, `0-9`, `.`, `_` and `-`, all lowercase (MMP §5.8): `backend-team`, `acme.prod`, `x-review--team-02779b950c3d8d7378fd11d6`. `default` is the global mesh; `sym` is reserved and refused. A name that is not a room is refused, never repaired. A room configured in `SYM_ROOM` or `.sym/node.json` that is not one stops the node from starting (no mesh node is built, nothing falls back to `default`), and every tool says why. A room is signed into every record, so a free-form name used before 0.11 names a different room from any identifier you map it to: choose the identifier once and keep it.
+
+> **Discoverable by the `sym` CLI.** This node also advertises its room on a shared `_symrooms._tcp` discovery beacon (room and node name in TXT; it carries no session), so the [`sym` CLI](https://www.npmjs.com/package/@sym-bot/sym)'s `sym rooms` lists this Claude/MCP node alongside CLI-daemon nodes. Discovery-only.
+
+### Same office (LAN)
+
+**Team lead creates the room from any Claude Code session:**
+
+```
+> sym_invite_create { "room": "backend-team" }
+
+Invite URL (LAN-only (mDNS)):
+    sym://room/backend-team?node=<nodeId>&key=<identity key>
+
+> sym_join_room { "room": "backend-team" }
+Moved from room "default" to "backend-team", same identity.
+```
+
+**Team lead shares the URL** over Slack, email, whatever.
+
+**Each teammate pastes the URL into their Claude Code session:**
+
+```
+> sym_invite_info { "url": "sym://room/backend-team" }
+Parsed invite: sym://room/backend-team
+
+> sym_join_room { "room": "backend-team" }
+Moved from room "default" to "backend-team", same identity.
+```
+
+No restart needed for the current session. Teammates on the same LAN now see each other; a `backend-team` node dials only advertisements whose TXT room is `backend-team`, so `frontend-team` nodes are never dialled. The move is a new node for the same identity: what this node already received stays received, with the same inbox ids, and none of it is delivered again.
+
+> **`sym_join_room` is runtime-only.** On the next Claude Code launch, the node restarts from its `~/.claude.json` config — if `SYM_ROOM` isn't persisted there, it reverts to the global mesh and your teammates' peer count silently drops to zero. Persist your membership before closing the session (see below).
+
+### Persisting your room across restarts
+
+The hot-swap above is convenient for trying a room, but a real team setup needs the room baked into the MCP env block so every Claude Code launch joins automatically. Two paths:
+
+```bash
+# (a) Reinstall with the --room flag — preserves SYM_NODE_NAME from the
+#     existing entry, adds SYM_ROOM, atomically rewrites ~/.claude.json:
+npx @sym-bot/mesh-channel init --force --room backend-team
+
+# (b) For a project-scoped install (multi-project laptop):
+cd path/to/project
+SYM_NODE_NAME=claude-myproject npx @sym-bot/mesh-channel init --project --room backend-team
+```
+
+After either path, restart Claude Code once; subsequent sessions auto-join the room. To switch rooms on a live entry use `--force` together with `--room`:
+
+```bash
+# Switch from one named room to another (one command):
+npx @sym-bot/mesh-channel init --force --room new-team
+
+# Revert to the global mesh (escape hatch):
+npx @sym-bot/mesh-channel init --force --room default
+```
+
+Without `--force`, an existing persisted `SYM_ROOM` always wins over a flag — the heal path's job is to never lose user state on a routine reinstall. With `--force`, the flag is the explicit override and takes precedence.
+
+Run `npx @sym-bot/mesh-channel doctor` any time to see which room each `claude-sym-mesh` entry is configured for. The doctor flags room mismatches across user-global and project-scoped entries — the most common cause of "we're on the same wifi but my teammate's node never appears in `sym_peers`".
+
+### Distributed team (via relay)
+
+Same pattern, but the sessions cross network boundaries — your laptop on the road and the Mac at home, home ↔ office, coffee shop ↔ client site. They need a relay to find each other over the internet. The plugin points cross-network invites at the hosted relay and mints the credential for you:
+
+```
+> sym_invite_create { "room": "eng-team", "cross_network": true }
+
+Invite URL (cross-network (relay)):
+    sym://team/eng-team?relay=wss%3A%2F%2Fsym-relay.onrender.com&token=<minted>
+```
+
+The token is 32 random bytes minted in your session. On the hosted relay it names an isolated channel: nobody who does not hold that exact token can see the channel exists, and two teams can never share one by picking the same phrase (tokens under 32 characters, and the example strings from older docs, are refused). Whoever holds the URL can join the channel, so share it as you would a password. To lock a device out, mint a new invite and re-join with it — there is no per-device revocation.
+
+Teammate pastes the URL, `sym_invite_info` extracts the relay and token from the query string, `sym_join_room` hot-swaps with the same args. The creator must join too (`sym_invite_create` prints the exact `sym_join_room` call). A team that runs its own relay passes `relay_url`, and `relay_token` if that relay only admits tokens its operator configured.
+
+A relay join is remembered. `sym_join_room` with a relay writes the credential to `~/.sym/relays/<room>.json` (mode 0600, under the state root — never into the project, so it cannot be committed by accident). The next start of a server that resolves the same room — a project that pins its room in `.sym/node.json`, or `SYM_ROOM` in the plugin env — re-joins the channel without being asked; `sym_status` shows `Relay credential: remembered for room '…'`. `sym_join_room { room }` with no credential uses the remembered one; `sym_join_room { room, lan_only: true }` forgets it. Explicit `SYM_RELAY_URL`/`SYM_RELAY_TOKEN` in the env still win over a remembered credential.
+
+The relay carries frames; it keeps none. Two sessions exchange CMBs when both are connected, so for the on-the-road ↔ home case keep the home side up — a `sym-daemon` on the always-on machine, or a Claude Code session left open.
+
+**When the relay says no.** A join over a relay returns the relay's answer, not "discovering peers":
+
+- `Relay: connected to wss://… for 3s, 1 relay peer(s)` — admitted; `sym_peers` shows who is there.
+- `Relay: REFUSED by wss://… (4003: <reason>) … Fix: mint a token with sym_invite_create or get the team's invite, then sym_join_room with it` — the token was not accepted. The call returns `isError`; the session also receives one `relay-auth-refused` channel notification with the same line. LAN peers are unaffected; the node keeps knocking every 10 min in case the relay's configuration changes.
+- `Relay: unreachable: wss://… (last close 1006) — retry in 4s, attempt 2. LAN peers are unaffected.` — the relay is down or unreachable from here (a Render deploy drops every connection for a few seconds); the node reconnects on its own.
+- `Relay: STOPPED: … another process holding this identity (4004)` — another connection authenticated as this node's nodeId: another process of this agent, or anyone holding the relay token (the relay's authentication proves no key). The server and its LAN node keep running; stop the other process if it is yours, then `sym_join_room` with the same room to dial the relay again.
+
+`sym_status` prints the same line at any time. The token is never part of any of these lines.
+
+### Discovering what's out there
+
+```
+> sym_rooms_discover
+
+Rooms advertised on this LAN (_sym._tcp, TXT room), by the other nodes visible now (3):
+  backend-team   2 node(s)  (← your current room)
+  default   1 node(s)
+  frontend-team   1 node(s)
+
+To join one, call sym_join_room with room="<name>". A node dials only an advertisement whose TXT room is its own, and the handshake is what admits.
+```
+
+It browses `_sym._tcp` for two seconds and groups what it hears by TXT room, counting distinct nodes (this node is not counted). Only a name that is a room is shown: an advertisement naming anything else, or no room, is counted and not printed, and no node name or key is shown. A node that does not list `mmp` 2.0 is said so (it cannot form a Core Secure session with this one). On a relay-only node (`SYM_LAN=off`) it browses nothing and says so.
+
+Only shows rooms with at least one other node online right now — there's no central directory of offline-but-known rooms (decentralised architecture). For cross-network relay-backed rooms, members must know the relay URL and token out of band (someone shares the invite URL).
+
+## How it works
+
+```
+Claude Code A                                              Claude Code B
+     ↕ (stdio + MCP)                                            ↕
+sym-mesh-channel  ←——  mDNS _sym._tcp  ——→  sym-mesh-channel
+     ↕                (LAN discovery; TXT room)                 ↕
+     └────────────  optional WebSocket relay  ───────────────┘
+                    (cross-network)
+```
+
+The plugin composes two open specs:
+
+- **[Claude Code Channels](https://code.claude.com/docs/en/mcp)** (Anthropic, 2026-03-20) — an MCP capability that lets servers push events directly into Claude's conversation context mid-turn via `notifications/claude/channel`. Anthropic built it for the Telegram/Discord/iMessage integrations. We use it for agent-to-agent cognitive coupling.
+- **[MMP — the Mesh Memory Protocol](https://meshcognition.org/spec/mmp)** — defines *what* gets pushed: typed seven-field cognitive bundles (CAT7: focus, issue, intent, motivation, commitment, perspective, mood), how receivers gate incoming signals ([SVAF](https://arxiv.org/abs/2604.03955)), and how peers maintain identity without a central orchestrator.
+
+**What happens on each message.** When a peer broadcasts a cognitive memory block (CMB), the local SymNode evaluates it via SVAF — Symbolic-Vector Attention Fusion, a receiver-side relevance gate that rejects low-signal messages before they reach Claude's context. If accepted, the MCP server fires a `notifications/claude/channel` notification to Claude Code, which surfaces it as a `<channel>` block in the conversation. Claude sees it, can react, and can broadcast back via `sym_send` or `sym_publish`. No polling. No tool calls. The mesh thinks together.
+
+**Identity and transport.** Each peer has its own Ed25519 keypair stored at `~/.sym/nodes/by-id/<nodeId>/identity.json` (sym 0.14; the name is an index). A peer exists only after the MMP v2.0 Core Secure handshake has proven its nodeId and key on a session, and every record is signed and verified before the channel sees it. Full architecture in MMP §4–§6 and §18.
+
+## Advanced: per-project node identity
+
+`sym-mesh-channel start` gives every folder a **stable, named peer**. It writes `.sym/node.json` with the node named after the folder (`claude-<folder>`, or `--name`) and the room (`--room`), so a `cto` folder and a `melotune-dev` folder on the same laptop each keep their name and room across restarts.
+
+Without `start`, the plugin names each session `claude-<repo>-<session>`, which changes per session. To pin a name by hand, commit a `.sym/node.json` to the project, e.g. `path/to/project/.sym/node.json`:
+
+```json
+{
+  "node_name": "cto",
+  "room": "my-team",
+  "node_id": "01a0fd15-52ca-726c-9ce1-5767a1379249"
+}
+```
+
+`node_id` is optional. With it, the folder's identity is loaded without minting: if it is not on
+this host, the node does not start and every tool says why, instead of quietly becoming a new agent
+with an empty memory. `sym_status` prints the line to add.
+
+Both the plugin's node and the `claude-sym-mesh` server read it on launch whenever Claude Code runs from that directory: the node takes that name and joins that room.
+
+- It lives in the repo, so it survives a plugin reinstall.
+- `SYM_NODE_NAME` / `SYM_ROOM` in the server's env still override it.
+- A missing file falls back to the auto name. A malformed file, or a `node_name` that breaks the naming rule (MMP §3.1.2; no path separators or names Windows reserves), is named on stderr and ignored.
+- Gitignore `.sym/` if the name is per-machine rather than something the team shares.
+
+> ⚠️ **One mesh server per session.** If the plugin is enabled and the project also registers `claude-sym-mesh` (a `.mcp.json`, or the `~/.claude.json` entry `start` writes), Claude Code runs both: one agent, two nodes, and only one of them gets real-time push. Both servers report this at startup and in `sym_status`. `start` prevents it by turning the plugin off for its folder (`"enabledPlugins": {"sym-mesh-channel@sym-bot": false}` in `.claude/settings.local.json`).
+
+*Standalone npm, no plugin?* A project-scoped server is fine there: `SYM_NODE_NAME=… npx @sym-bot/mesh-channel init --project` writes `<project>/.mcp.json`. Just never combine it with the plugin.
+
+## Cross-network setup (own-hosted relay)
+
+LAN-only is enough for two people sitting next to each other. To connect across networks without relying on our hosted relay, run your own:
+
+```bash
+git clone https://github.com/sym-bot/sym-relay
+cd sym-relay && npm install && npm start
+# or deploy the included Dockerfile to Render / Fly / Railway / etc
+```
+
+Then point peers at the relay inline when joining a room (see [Team mesh rooms → Distributed team](#distributed-team-via-relay)) or set the env vars globally in your `claude-sym-mesh` entry in `~/.claude.json`:
+
+```json
+"env": {
+  "SYM_NODE_NAME": "claude-mac",
+  "SYM_RELAY_URL": "wss://your-relay.example.com",
+  "SYM_RELAY_TOKEN": "your-shared-token"
+}
+```
+
+Both peers must use the same relay URL and token to land on the same channel. The relay supports per-token channel isolation so you can run a single relay for multiple rooms.
+
+## Security boundaries
+
+A peer message is external input. Treat it that way.
+
+- Incoming CMB fields pass through receiver-side relevance and injection-risk checks before they can be surfaced.
+- The channel injects text context. It does not declare Claude's permission-relay capability.
+- Rate and payload limits reduce abuse; they are not a security guarantee.
+- A delivery these checks withhold is listed in `sym_receive` by id, sender and reason, and none of its text is shown. It is never left out of the count. The same checks apply to `sym_fetch` and to a peer's memory in `sym_recall`.
+- A room name or relay token is not a complete enterprise trust boundary.
+- Keep human approval for consequential actions.
+
+**Optional peer allowlist.** Set `SYM_ALLOWED_PEERS=sha256:<fingerprint>,<nodeId>@sha256:<fingerprint>` to restrict whose records can reach Claude's context; it is judged against the verified signer and the key it proved (`sym_peers` prints each peer's fingerprint). A bare `<nodeId>` (0.11.0's form) still works and is warned about: whoever first proves a key under a nodeId is allowed by it. Names are labels, so an entry that is neither a key nor a nodeId is ignored and reported, and a list with no usable entry allows nothing. When empty (default), every peer this node verified remains eligible for the other receiver-side checks.
+
+**Verified or not shown.** A delivery without the node's verification facts — from a Legacy Import session, received before this node ran Core Secure, or unverified — is listed by id and reason and never shown.
+
+**Payload and rate limits.** `SYM_MAX_PAYLOAD_BYTES` (default 1048576) is the largest payload shown; a larger one is withheld and named, and stays in the inbox. A payload within it is read on demand, and `sym_fetch` returns a long message in parts, each naming the `offset` of the next. `SYM_RATE_LIMIT` (default 30) is how many deliveries from one session per minute are pushed in real time; the rest wait for `sym_receive`. A payload is the record's signed application section, which MMP bounds at 512 KiB.
+
+See [SECURITY.md](../SECURITY.md) for the full threat model.
+
+## Requirements
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Node.js ≥ 20 | ✓ | ✓ | ✓ |
+| Claude Code ≥ 2.1.97 (Channels feature) | ✓ | ✓ | ✓ |
+| mDNS for LAN discovery | built-in | built-in (the SDK speaks mDNS itself) | built-in |
+
+## Limitations
+
+Clear-eyed about what's not there yet:
+
+- **Channels still needs a dev flag** for real-time push. The MCP tools work without it; the async push UX does not. Tracking: [anthropics/claude-plugins-official#1512](https://github.com/anthropics/claude-plugins-official/issues/1512).
+- **Corporate networks often block mDNS multicast.** If LAN discovery fails on the same wifi, fall back to a relay.
+- **No offline directory of known rooms.** `sym_rooms_discover` only shows rooms with at least one node currently online. For cross-network relay-backed rooms, invite URLs must be shared out of band.
+- **One mesh identity per process.** Two Claude Code sessions on the same machine with the same node name collide. The second one's server starts without a mesh node, and every mesh tool says which name is held and how to fix it. Use one folder per agent (`start` names the node after the folder), or `--name`.
+- **First contact is trust on first proven use.** A peer you have never met is bound to the key its first session proves; an invite pins the issuer's key out of band. See [SECURITY.md](../SECURITY.md#layer-1-transport-and-peer-identity-mmp-v20-core-secure-sym-014).
+- **0.13 peers are not heard.** sym 0.14 speaks only Core Secure. A 0.13.17 or older node advertises no `mmp`, so a 0.14 node never dials it as Core Secure on the LAN, and over a relay the Core Secure handshake with it never completes. Such a node is reached only through a Legacy Import route on the sym side, and what it delivers is withheld here as unverified. **Upgrade every node of a room together.**
+- **Role grants signed by sym 0.13 confer nothing.** Authority is sym's MMP §6.6 store, rooted at an anchor pinned out of band (`SYM_FOUNDER_ANCHOR` in this server's env). With none, nothing is in force and every peer resolves as a participant; `sym_status` says which. The channel decides nothing from authority; it shows what the store says.
+- **Messages and moods are kept in the channel's own feed**, journalled in the node's directory, not in the SDK's inbox. Their `m` ids survive a restart and are never reused. A mind attached through a node's interior sees neither.
+- **A cited reply is never gated.** sym 0.14 applies MMP §15.7's remix guard to `remix()`, which this channel does not call, and never to a record the agent writes with `parents`. A record sym refuses to build or sign (a category over its 256 KiB bound, say) is answered "Not sent", and a held reply it refuses at flush is reported STUCK in `sym_peers`.
+
+## Troubleshooting
+
+### `/mcp` reports "Failed to reconnect to claude-sym-mesh"
+
+Run the diagnostic:
+
+```bash
+npx -y @sym-bot/mesh-channel doctor
+```
+
+It lists every `claude-sym-mesh` entry in `~/.claude.json` (user-global plus every project-scope) with `[live]` or `[STALE]` next to each. A stale entry is one whose configured `server.js` path no longer exists on disk — common after moving or reinstalling the repo.
+
+Heal every stale entry in one pass:
+
+```bash
+npx -y @sym-bot/mesh-channel init
+```
+
+`init` preserves each entry's `SYM_NODE_NAME` so your mesh identity doesn't drift. Live entries are left alone; `--force` is only needed to overwrite a live entry deliberately. Restart Claude Code after healing — MCP servers are spawned at session start and won't pick up config changes mid-session.
+
+### Peers connect (Claude Code starts cleanly) but never appear in `sym_peers`
+
+Almost always a **mesh room mismatch** — a node dials only an advertisement whose TXT room is its own, so `default` and `backend-team` nodes on the same wifi are invisible to each other. The other common cause is a peer on sym 0.13 or older, which does not list `mmp` 2.0 and cannot form a Core Secure session with this node. Two diagnostics:
+
+```
+> sym_status         # shows: Room: <name> — advertised on the LAN as _sym._tcp, TXT room=<name>
+> sym_rooms_discover  # shows every room currently advertising on the LAN, and nodes without mmp 2.0
+```
+
+If your teammate's node is on a different room, align via `sym_join_room` (this session) and persist via `init --room <name>` (future sessions). Run `npx @sym-bot/mesh-channel doctor` to confirm the persisted room on every entry — the doctor explicitly flags mismatches across user-global and project-scoped configs.
+
+This is the failure pattern where every other indicator looks healthy: `sym_status` says `Peers: 0` but the underlying SymNode is fine, the mDNS service is registered, and the relay (if any) is connected — they're just announced in a room your peer isn't in.
+
+### Peers don't see each other on the same wifi
+
+Check that mDNS works (the SDK speaks it itself, so no system daemon is needed; these tools only let you look):
+
+- macOS: `dns-sd -B _sym._tcp` (built-in)
+- Linux: `avahi-browse -r _sym._tcp` (if `avahi-daemon` is installed)
+- Windows 10+: if discovery fails, check Windows Firewall allows mDNS (port 5353 UDP).
+
+Each entry is one node; its TXT carries `room` and `mmp`. Two nodes meet only when both name the same room.
+
+Some corporate networks block mDNS multicast entirely — try a hotspot or home wifi to verify. If LAN is blocked, fall back to a relay.
+
+### `<channel>` notifications never arrive even though peers are connected
+
+The tools work without any flag. The real-time `<channel>` **push** is separate: Claude Code only delivers channel notifications for channels on its **approved-channels allowlist**, and sym-mesh-channel isn't on it yet — so push requires the development-channels flag matching your install path:
+
+- plugin install: `--dangerously-load-development-channels plugin:sym-mesh-channel@sym-bot` (or `@claude-community` if you installed from the Anthropic community directory — the handle must match your install source)
+- npm install: `--dangerously-load-development-channels server:claude-sym-mesh`
+
+The server cannot tell whether a push reached you, and does not guess. Call `sym_push_confirm {}` to have a push check sent: if the notification arrives, confirm with its code; if it does not, push is not reaching this session, and `sym_receive` is how you read deliveries. This is an Anthropic-side gate, not a bug here. Tracked in [anthropics/claude-plugins-official#1512](https://github.com/anthropics/claude-plugins-official/issues/1512).
+
+### `sym_status` says "Relay: connected" when you didn't configure one
+
+Your shell profile (`~/.zshrc`, `~/.bashrc`) exports `SYM_RELAY_URL`. Claude Code's MCP env block is **additive** — omitting a key doesn't remove it from the child process. Fix: set `SYM_RELAY_URL` and `SYM_RELAY_TOKEN` to `""` in the MCP env block. The installer does this automatically as of v0.1.8.
+
+### Multiple Claude Code sessions on the same machine want to share an identity
+
+Don't. Each agent should have a distinct node name; `start` gives each folder its own. The SymNode takes an exclusive lock on its identity (in `~/.sym/nodes/by-id/<nodeId>/`) and refuses a second process with the same identity. That second server starts without a node, and every mesh tool answers `MESH NODE NOT RUNNING: node identity '<name>' … is already held by a live process (PID n)`. Close the other session, or give this one its own name with `--name`, `node_name` in `.sym/node.json`, or `SYM_NODE_NAME`.
+
+On **Windows**, if no process with that PID is this agent, delete the lock file the message names and restart.
+
+### Two mesh nodes in one session (a `MESH NODE ADVISORY` at startup)
+
+The plugin is enabled *and* the session also runs a `claude-sym-mesh` server: from `~/.claude.json`, which `start` writes, or from a project `.mcp.json`. Claude Code runs both, so one agent shows up as two nodes, and real-time push reaches only the one named in `--dangerously-load-development-channels`. Run `sym-mesh-channel start` in the folder, which turns the plugin off there. Or set `"enabledPlugins": {"sym-mesh-channel@sym-bot": false}` in `.claude/settings.local.json` yourself. Or remove the `claude-sym-mesh` server and use the plugin alone.
+
+(Older versions named the second node `<name>-2`. Names are never auto-suffixed now: a suffix would be a separate store with a separate signing key.)
+
+## Advanced: named agents, teams & the CLI
+
+Everything above uses the plugin — all most users need. Install the engine as an npm package / MCP server instead **only** when you want one of these:
+
+- **A persistent, *named* agent.** The plugin auto-names each session (`claude-myrepo-3f9a`); the server install lets you pin `SYM_NODE_NAME=cto` so the node always appears under the same name in `sym_peers`, mesh memory, and CMB lineage — a durable agent identity, not an anonymous session.
+- **Team config committed to a repo.** Config lives in a project `.mcp.json`, so you can commit `SYM_ROOM=backend-team` (plus relay URL/token) into the repo — anyone who opens it in Claude Code auto-joins the team room with zero per-person setup.
+- **The `sym` CLI and non-Claude agents.** This also installs [`@sym-bot/sym`](https://github.com/sym-bot/sym), giving you `sym ask` / `sym rooms` in your terminal and an engine that other agents, scripts, and languages can share.
+
+```bash
+npm install -g @sym-bot/mesh-channel
+```
+
+This registers a raw MCP server keyed `claude-sym-mesh`. Because it's a server (not a plugin), its real-time channel handle is **`server:claude-sym-mesh`** — so launch with:
+
+```bash
+claude --dangerously-load-development-channels server:claude-sym-mesh
+```
+
+Pin a fixed per-session identity with [per-project node identity](#advanced-per-project-node-identity); set relay credentials in the env block per [cross-network setup](#cross-network-setup-own-hosted-relay).
+
+## References
+
+- [SVAF paper](https://arxiv.org/abs/2604.03955) — Xu, 2026. *Symbolic-Vector Attention Fusion for Collective Intelligence*. arXiv:2604.03955.
+- [MMP paper](https://arxiv.org/abs/2604.19540) — Xu, 2026. *Mesh Memory Protocol: Semantic Infrastructure for Multi-Agent LLM Systems*. arXiv:2604.19540.
+- [MMP spec v1.0](https://meshcognition.org/spec/mmp) — Mesh Memory Protocol specification (canonical web version).
+- [sym-swift](https://github.com/sym-bot/sym-swift) — iOS/macOS SDK implementing the same protocol.
+- [sym-relay](https://github.com/sym-bot/sym-relay) — WebSocket relay for cross-network mesh.
+
+## License
+
+Apache 2.0. Built and owned by **[SYM.BOT](https://sym.bot)**, the trading name of SYMBOT LTD.
+
+## Offline peers: held mail
+
+A directed send to a peer that has no session now is **held in your outbox** and sent when that
+peer's session returns. `sym_peers` lists anything still waiting.
+
+- **Held is not delivered.** The queue is on your machine; the recipient cannot see it.
+  If your node does not come back, the message is lost.
+- **Only nodeIds you have had a Core Secure session with** can be held for: a `peer-joined` counts
+  only when `sym_peers` shows that peer's session as a proven Core Secure one, never a Legacy Import
+  session. An unknown nodeId is refused, so a typo creates nothing, and a name is never a route.
+- **A held reply keeps its lineage.** sym never refuses a reply for citing a peer's record. If it
+  refuses to build one when the peer returns (a category over its bound, a key that cannot sign), the
+  item is marked STUCK with sym's own reason in `sym_peers`, not reported as waiting; it is tried
+  again after you publish, or `sym_outbox_discard` drops it. A stuck item does not hold up the ones
+  behind it at the next flush.
+- **The sender must return** to flush — holding does not help when the sender is the
+  intermittent one.
+- A 0.10 item held for a name is converted to its nodeId when the old roster recorded one;
+  otherwise `sym_peers` lists it under its label, and `sym_outbox_discard {peer: "<label>"}` clears it.
+
+## Interior mode: a node's mind
+
+An XMesh cognitive node (or any sym 0.14 node) can run a Claude session as its **mind**: the node
+keeps its key, its store and its learned admission profile, and the session submits drafts the node
+checks and signs as itself (XMesh design C2, sym design D9.3). The session has no mesh identity.
+
+```bash
+SYM_INTERIOR_SOCKET=/path/to/node/interior.sock \
+SYM_INTERIOR_CAPABILITY_FILE=/path/to/capability   # yours, 0600, or it is refused; or SYM_INTERIOR_CAPABILITY
+SYM_INTERIOR_KIND=observe                           # the default submission kind
+```
+
+- `sym_send` and `sym_publish` submit; a refusal (a kind the mission did not declare, an intent
+  that is not the kind, a recipient outside its allowlist, a parent outside the mind's scope, the
+  rate) is said in plain words. The node signs the kind as the record's intent, so leave intent out.
+- `sym_peers`, `sym_join_room`, the invite tools and the outbox are not available: the node owns
+  its room and its peers.
+- The mind reads the node's deliveries through the interior ([DESIGN-0.11.0.md §6](DESIGN-0.11.0.md)),
+  gated exactly as in node mode. The node gives it only what arrived for its mission while it runs
+  (a directed delivery only from a nodeId the mission may address); recall and `parents` are limited
+  to those, its own submissions and the mission's context. A node that serves no read side is
+  reported as such; a request the node refuses is reported as a refusal, not as unsupported.
+- The capability is bound to the one connection the channel opens; the node refuses it on any other
+  (`capability-bound-to-another-connection`). When that connection closes, this mind is detached and
+  says so, and the channel never reconnects with it.
+- When the host's stdin closes, the channel ends the mind, which revokes its capability.
+  `SYM_INTERIOR_END_ON_EXIT=0` leaves it running.
+
+## Codex setup (full)
+
+Install the server:
+
+```bash
+npm install -g @sym-bot/mesh-channel@latest
+command -v node      # → absolute node path for the config below
+npm root -g          # → global modules path for the config below
+```
+
+Add to `~/.codex/config.toml` (or `<project>/.codex/config.toml`):
+
+```toml
+[mcp_servers.claude-sym-mesh]
+enabled = true
+required = true
+command = "/absolute/path/to/node"
+args = ["/absolute/path/to/node_modules/@sym-bot/mesh-channel/server.js"]
+cwd = "/absolute/path/to/your/project"
+startup_timeout_sec = 30
+tool_timeout_sec = 90
+
+[mcp_servers.claude-sym-mesh.env]
+SYM_NODE_NAME = "codex-mac"
+SYM_ROOM = "your-room"   # REQUIRED — a wrong or missing room fails silently
+```
+
+- **`required = true`** makes a failed startup fail loudly instead of leaving a silently
+  tool-less session.
+- **Absolute paths** — do not rely on `PATH` resolution.
+- **`SYM_NODE_NAME`** pins identity. A collision is refused, never auto-suffixed: the second
+  process runs without a node and says why on every tool.
+- **`SYM_ROOM` is required.** For Codex the fallback is `process.cwd()` — a seat launched
+  from the wrong directory joins `default` while its Claude Code sibling stays in the
+  named room. Nothing errors; the two simply stop seeing each other.
+
+Then **quit and reopen the Codex app** — it does not rebind a running MCP server.
+Verify from both sides with `sym_room_info`.
+
+Codex reads its inbox only when `sym_receive` runs. Add a standing instruction to your
+project's `AGENTS.md`:
+
+```markdown
+At the start of every task turn, call `sym_receive` in draining mode. During
+long-running work, call it again between major milestones.
+```

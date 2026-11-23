@@ -1,0 +1,2028 @@
+# Changelog
+
+## 0.11.2
+
+A fix for `sym-mesh-channel start` on Windows after a Claude Code auto-update. Nothing changes on the wire or in the tools; it
+requires the same `@sym-bot/sym` and Node.js as 0.11.1.
+
+### Fixed
+
+- **`start` no longer launches an npm `claude.cmd` whose `claude.exe` is gone.** An npm global install of Claude Code puts a
+  `claude.cmd` shim on PATH that runs `node_modules\@anthropic-ai\claude-code\bin\claude.exe`. When an auto-update renames that exe
+  aside (`claude.exe.old.<n>`) and does not put the new one in place, the shim stays, so 0.11.1's file check took it and `cmd.exe` then
+  answered only `'"...\bin\claude.exe"' is not recognized as an internal or external command`. `start` now checks the shim's target
+  (the npm package is there and its exe is not), passes over such a shim, and looks on: the system PATH, the install folders (the native
+  `~/.local/bin`, winget, the local installer). If nothing else works it says what is broken and how to repair it: the exact
+  `Copy-Item` from the platform package npm installed beside it (what the package's own postinstall does), or
+  `npm install -g @anthropic-ai/claude-code` with no Claude Code session open. A `SYM_CLAUDE_BIN` that names such a shim is an error
+  that says so, not a launch that fails inside `cmd.exe`. A healthy npm install, a shim with no npm package beside it, and every
+  non-Windows platform are unchanged.
+
+### Tests
+
+- The three Windows end-to-end `start` cases that say "claude is not on PATH" or "no claude anywhere" read the developer's real
+  registry PATH, so on a machine that has Claude Code installed they found it and failed. They now run with the registry unreadable
+  (`test/_no-registry.cjs`, a test-only preload), so they mean what they say on any machine.
+- Four cases for the broken shim, and a mutation check (M49) that fails the suite when the shim is taken again.
+
+## 0.11.1
+
+A stability and security release on the 0.11 line, from an independent review of 0.11.0 (R4). Requires
+`@sym-bot/sym` `^0.14.2` (0.14.0 and 0.14.1 have start-lock and daemon bugs; this release is tested against 0.14.2, and the lockfile now pins it) and Node.js 20 or later; nothing changes on the wire, and 0.11.0 and 0.11.1 nodes
+mesh with each other.
+
+### Fixed — critical
+
+- **A relay close 4004 no longer stops the server (R4-1).** The relay's authentication carries no key
+  proof, so anyone holding a relay token could authenticate as a peer's (public) nodeId, have the relay
+  close that peer with 4004, and the peer's MCP server exited with code 2: every mesh tool of that
+  session was gone, LAN included. The server and its LAN node now keep running through 4004 and 4006.
+  The stop is said on stderr, in one push (`relay-stopped`), once in the next tool answer and in
+  `sym_status` for as long as it lasts, with what sym does next: sym 0.14.2 does not dial the relay
+  again; sym 0.14.3 retries on a long backoff, and when it finds a ping-pong (two processes replacing
+  each other, `pingPong` on the event) the channel pushes that once more and says another process is
+  probably running as this agent. `sym_join_room` with the room the node is in, and no relay named, now
+  keeps the relay it had, so it dials the relay again without a restart.
+  SECURITY.md said both "it then re-handshakes" and "the server exits with code 2"; it now says what
+  happens.
+- **`sym_receive` no longer moves past a delivery it never showed (R4-2).** It drained the SDK inbox with
+  `inbox({ limit: Math.max(1, unread taken) })`: when every inbox item in the batch had already been read
+  by id (`sym_fetch` acknowledges it), the `max(1, 0)` drained one unread delivery the batch did not
+  hold, and no line ever listed it. The limit now counts unread deliveries, as sym's own does; the batch
+  is a merge that takes a prefix of the inbox and of the host's feed in their own order (a clock that
+  stepped back cannot reorder them); the inbox is drained by exactly the unread items taken, and when
+  none were, only if it holds no unread item at all (it then passes read items only); and what the drain
+  returns is checked against the batch, so an unread item it took is listed rather than lost. No sym API
+  change.
+
+### Fixed — high
+
+- **`start` finds Claude Code itself, so it starts on Windows after an update.** On Windows `start` failed with
+  `'claude' is not recognized as an internal or external command` once Claude Code had been updated (or moved
+  by an installer): it ran the bare name `claude` through a shell, which finds Claude Code only where THIS
+  process's PATH reaches. A terminal opened before the PATH changed keeps the old one for every process it
+  starts (npx included), and a `claude` that only the user's own shell defines as an alias or a function is
+  invisible to a child process. `claude-bin.js` now looks where Claude Code can be, first hit wins:
+  `SYM_CLAUDE_BIN` (explicit; a wrong value is an error, never a fall-through to another claude), this
+  process's PATH (by PATHEXT on Windows), the system PATH as the registry holds it now (Windows), the folders
+  Claude Code installs into (`~/.local/bin`, `~/.claude/local`, the npm global folder, winget), and last
+  `CLAUDE_CODE_EXECPATH` (a versioned file an update may have removed, so the launcher beats it). A `.exe` or a
+  POSIX file is started directly, with no shell; an npm `.cmd` shim goes through cmd.exe with every word quoted
+  (Node refuses a batch file otherwise). When `claude` is found anywhere but on PATH the launch says where;
+  when it is found nowhere the error lists every place it looked and the three ways out (`Get-Command
+  claude`, `SYM_CLAUDE_BIN`, a new terminal). Not checked: a real Windows machine (the Windows cases are
+  decided with the platform, the environment and the file system injected); the winget and local-install
+  folders are best-effort and an absent one costs one stat.
+  Hardened by the pre-publish review: an npm `.cmd` shim's arguments are escaped for BOTH parsers that read them (the
+  C runtime, then cmd.exe twice, as the shim forwards `%*`), so a passthrough argument like `--add-dir "C:\My Projects\"`,
+  `%PATH%`, `a&b`, `x^y` or a quote reaches `claude` as typed (tested on a real Windows runner against a shim that
+  forwards `%*` to node); `reg.exe` is run by its absolute path (a bare name is looked for in the project folder first
+  on Windows); `SYM_CLAUDE_BIN` may also be a path without its extension (Windows) or a bare name looked up on PATH; a
+  `claude` killed by a signal makes `start` exit 128 plus the signal, not 0.
+- **An `http://` or `https://` relay URL works again (review B2).** 0.11.0 accepted them (the WebSocket client dials
+  them as `ws` and `wss`) and users paste `https://`; an earlier draft of this release treated them as not a relay
+  and turned the relay off without saying why. A new test connects through an `http://` URL.
+
+- **A fault at startup no longer kills the server before MCP connects (R4-3).** Only a closed list of
+  identity errors became a fault the tools report; anything else (a read-only or non-directory
+  `SYM_STATE_DIR`, an identity file that does not parse, a start that throws) ended in a stack trace
+  and exit 1. Every build or start error is now said in the instructions and by every tool, and the
+  server connects. A relay URL that is not `ws://`, `wss://`, `http://` or `https://` (no scheme, `ftp://`,
+  not a URL) turns off only the relay: the node runs, LAN peers only, and the instructions and `sym_status`
+  say why without repeating the value. `sym_join_room` refuses such a relay before it touches the node.
+  An uncaught error before MCP connects is counted and said, as after, not fatal.
+- **The installer keeps `~/.claude.json` owner-only (R4-4).** It wrote a tmp file with the default mode
+  and renamed it over the original, so a 0600 file holding `SYM_RELAY_TOKEN` came back 0644. Every write
+  (`~/.claude.json`, a project's `.mcp.json` and `.claude/settings.local.json`, the folder's
+  `.sym/node.json`, the removed-pin note) now creates the tmp file with the original's mode (0600 for a
+  new file), chmods it before the rename, and keeps `~/.claude.json` and its backups owner-only.
+- **A peer label cannot copy another peer's tag (R4-5).** The label filter was a denylist, and lookalike
+  brackets and arrows (U+3008, U+3009, U+27F6), zero-width and bidi characters passed it. A label is now
+  printed by an allowlist: bare only when it is a plain name (words of `A-Z a-z 0-9 . _ @ + # -`, single
+  spaces, at most 64 characters, no word "via", and a name this host's `nodeNameProblem` accepts);
+  anything else in quotes, with every character outside printable ASCII as a `\u` escape. It holds on
+  every surface: the push, `sym_receive`, `sym_peers`, `sym_fetch`, `sym_recall`, the outbox lines.
+  "(2 keys)" now also counts labels that look the same (Cyrillic and Greek lookalikes, `1`/`l`/`I`,
+  `0`/`o`, invisible characters removed).
+
+### Fixed — medium
+
+- **No answer built from an invite repeats its relay token (R4-6).** sym's parse error repeated the
+  first 120 characters of the text, token included, and `sym_invite_info` printed the token three times.
+  A text that is not an invite is now described (wrapped in `< >`, a line break, a `#fragment`, no
+  scheme), never repeated; an invite with a space or a line break in it is refused before sym's parser,
+  which took a wrapped one with the break inside the token; `sym_invite_info` shows the token's length
+  only; `token=` is redacted in every error, relay line and log line the channel builds. (sym's own echo
+  is fixed in sym.) `sym_invite_create` still prints the invite it was asked to make.
+- **"(2 keys)" survives a restart (R4-7).** The labels each key was seen with were counted from this
+  process's memory, so after a restart an impostor's first line under a known label looked like the real
+  peer's. The keys, their labels and nodeIds are now written down in the node's `known-peers.json`
+  (bounded) and counted with the ones learned in this run.
+- **`SYM_ALLOWED_PEERS` allows by key (R4-8).** It allowed whoever first proved a key for a listed nodeId
+  (a nodeId is public, and sym binds an unbound one to the key its first session proves). An entry is now
+  `sha256:<fingerprint>` (that key, under any nodeId) or `<nodeId>@sha256:<fingerprint>` (that pair only).
+  A bare nodeId, 0.11.0's form, still works and is warned about on stderr, in the instructions and in
+  `sym_status`, which prints the fingerprint each listed nodeId proves now. `sym_peers` prints each
+  peer's full key fingerprint.
+- **Records sym drops past a peer's budget are said (R4-10).** sym evaluates at most 8 records a second
+  per session (a burst of 32) and drops the rest before delivery, saying so only in its own log, which
+  this server silences; the sender was told its message was handed to a session. The channel now counts
+  sym's `cmb-over-budget` and `cmb-over-verify-budget` metric events: `sym_status` says how many and from
+  whom, and the next tool answer says it once (at most every 10 minutes).
+- **room-discovery's tests 6 to 8 ran (R4-11).** They were cancelled on every run: the browse's timer is
+  unref'd (right for a server, whose stdin holds the process), and the stand-in browser held no handle,
+  so node:test saw an empty event loop mid-browse. The stand-ins now hold one, as a real socket does.
+- **The release gate tests the sym that is installed (R4-12).** It demanded that the installed sym be the
+  lockfile's exact version, so a newer sym in range failed the gate while every other test ran on it. It
+  now holds package.json, the lockfile and one constant (`SYM_RANGE` in test/release-gate.test.js, the
+  place to set the sym a release is built on) together, and checks the locked and the installed sym
+  against that range.
+
+### Fixed — low
+
+- **The library no longer cites its owner.** Comments, documentation, the changelog and the tests recorded some decisions as
+  someone's ruling, and a few named a person or a machine. They now record the decision (with its date where that matters)
+  and nothing else, and a test (`test/no-owner-citings.test.js`) scans every tracked text file so none comes back. The names
+  of real settings (`SYM_FOUNDER_ANCHOR`) and the package author field are unchanged. A stray developer preview config
+  (`.claude/launch.json`, a local path to another project) is no longer tracked. Versions already published keep the text they
+  were published with.
+
+- **Invisible characters in peer text are escaped (R4-13).** A lead was JSON-quoted, which escapes only
+  C0 controls; C1 controls (U+0085), bidi overrides and isolates (U+202E, U+2066), zero-width characters
+  (U+200B), the invisible tag characters, the line separators, private-use and unassigned code points and
+  variation selectors now are `\u` escapes too, in a lead and inside a fetched body's fence. A label's
+  " via " rule could be passed with NBSP; labels are quoted and escaped now (R4-5).
+- **The package ships what a user needs (R4-14).** `files` no longer ships `scripts/` (the release script
+  and the packed-artifact gate), and the README's and CHANGELOG's links to `docs/` (images, the reference,
+  the design) are absolute GitHub URLs, since `docs/` is not in the package. A test checks that every
+  relative link in a shipped document resolves to a shipped file.
+
+### Known, not fixed here
+
+Found by the pre-publish review of this release and left for 0.11.2 on purpose (none loses a message or opens a
+hole; each is a readability, cost or hardening item that needs its own validation):
+
+- A peer label or message body with non-ASCII text is shown escaped (`Zo\u00eb`, `\u674e\u96f7`, `\u000d` for a CRLF, ZWJ
+  and variation selectors in an emoji): safe and complete, but noisier than 0.11.0 for non-English names. A label
+  with letters of a left-to-right script will be shown as it is, once the confusable check (the "(2 keys)" skeleton)
+  is validated for it.
+- Counting the keys that share a label recomputes each stored label's skeleton on every line (23 ms per line at
+  2000 keys with 8 labels each): it will be cached.
+- The installer still drops `SYM_ALLOWED_PEERS` from a `~/.claude.json` env when it rewrites a stale entry (as 0.11.0
+  does; it fails open): carry it over or warn.
+- A `~/.claude.json` that is already 0644 and its old `.bak-*` files stay 0644 until the installer next rewrites
+  that file; the fix is not retroactive.
+- `start` takes the `claude` its PATH names before an install folder, as your shell would: a stale `claude` earlier on
+  PATH (an old npm-global install) wins over the newer native one. Remove the stale one or set `SYM_CLAUDE_BIN`.
+- Joining back to the original environment room after a detour does not restore the environment's relay (as 0.11.0).
+
+- **R4-9** (a folder that pins another agent's nodeId under this folder's name re-points this folder's
+  agent) is sym's name index; it is fixed in sym 0.14.3. The end-to-end test for it runs once sym 0.14.3
+  is installed and is skipped before.
+- **R4-15**: the push confirmation (`sym_push_confirm`) is this process's, not the conversation's. A host
+  that starts a new conversation on the same server keeps it, so a delivery pushed before is named, not
+  repeated, to a conversation that never saw the push; a server restart loses it (the safe direction).
+  This server cannot see a conversation boundary.
+- With sym 0.14.2, a relay that closed this node with 4004 or 4006 is not dialled again until
+  `sym_join_room` or a restart.
+
+## 0.11.0
+
+Requires `@sym-bot/sym` `^0.14.0` (published 2026-10-13, npm tag `next`), MMP v2.0 Core Secure, and
+Node.js 20 or later. A peer is now a proven session, and every record is signed and verified before
+the channel sees it. The channel is rebuilt around that: it shows what the node verified, and nothing
+else. Design: [docs/DESIGN-0.11.0.md](https://github.com/sym-bot/sym-mesh-channel/blob/main/docs/DESIGN-0.11.0.md). This release supersedes the unreleased
+0.10.2 branch.
+
+**Breaking: it cannot mesh with 0.13.17 or older peers on a LAN, nor with a 0.10 channel.** sym 0.14
+speaks only Core Secure. A 0.13.17 node advertises no `mmp`, so a 0.14 node never dials it as Core
+Secure; over a relay the Core Secure handshake with it never completes. A 0.13 node is heard only
+through a Legacy Import route configured on the sym side, and what it delivers is withheld here as
+unverified. Upgrade every node of a room together. Also breaking: a room must be an MMP §5.8
+identifier (below), and role grants signed by sym 0.13 confer nothing under sym's MMP §6.6 authority
+until they are re-issued.
+
+### Changed — every delivery says who signed it, by key
+
+- **Provenance travels with the delivery.** A delivery is shown as verified only when its own entry
+  says so: marked verified, on a Core Secure session, with facts whose author nodeId and key match
+  the entry's author and whose delivering session matches. Anything else is listed by id and reason
+  and never shown, on every surface: a Legacy Import record, an entry with no Core Secure provenance
+  (a 0.13 inbox entry), facts that do not match. The SDK persists the facts with the inbox item, so a
+  restart decides the same; the channel keeps no second store of them and joins nothing.
+- **A message or a record's mood** is decided by the same rule, from the frozen facts sym's event
+  carries by the inbox entry's names (`verified`, `profile`, `verification`, `session`). Nothing is
+  looked up.
+- **A signer is identified by its key.** A line shows the signer's label and the shortest suffix of
+  its key fingerprint that is unique among the keys this node knows (at least 8 hex characters), and
+  says "(2 keys)" when two known keys use one label, "(one key, 2 nodeIds)" when one key is bound
+  under two. The known keys are the node's own bindings plus those learned from verified facts.
+  Labels and nodeIds are both chosen by their owner, so neither is ever truncated to identify anyone.
+  `sym_fetch` gives the full nodeId and fingerprint (`sha256:<hex>`, the form sym gives), where the key came from (an invite, a proven session, a grant), the assertion, the
+  room, the record's own lineage, and whether it was stored.
+- **Peer text is data.** A push is one line: the tag, a quoted and escaped excerpt of at most 100
+  characters, and the id; the facts travel as structured notification meta. `sym_receive` escapes the
+  same way. The full signed text is shown only by `sym_fetch`, between fence markers carrying a nonce.
+- **Only the signed parts are shown:** the seven CAT7 texts and the signed application data, read from
+  the record's signed projection that sym keeps with each item. A key outside CAT7, a mood's valence
+  and arousal, and the SDK's rendered content string are never shown.
+- **A withheld delivery names its category, never its text** (XMesh World): `withheld ·
+  injection-pattern — …`, `withheld, not verified · no-provenance: …`, `quarantined delivery ·
+  classifier-risk (2 flagged terms)`. The operator's `[sym-security]` line on stderr carries the
+  category and our own counts, and no excerpt of the peer's text. The content policy is unchanged.
+- **Moods** (MMP §9.3): a mood from a record SVAF rejected is shown with that record's verified facts.
+  A mood frame carries no record, so nothing in it is signed: it is shown as the word of the proven
+  peer of the session it came on, labelled unsigned on every surface (`[alice ⟨…⟩ mood, unsigned]`),
+  with nothing to cite. Any other mood is listed by id with the reason. No other name a frame claims
+  is printed, and moods are rate-limited per proven sender.
+- `sym_recall` shows this node's own records (by its proven nodeId) and peers' records verified when
+  admitted, and counts the rest.
+
+### Changed — lineage at the emit surface, never dropped
+
+- `sym_send` and `sym_publish` take `parents`: CMB keys, or delivery ids that the server resolves to
+  their keys. MMP §14.3: a response to mesh signals carries its lineage. The instructions say so.
+- sym 0.14.0 never gates a record on the parents it cites: MMP §15.7 belongs to `remix()`, which is
+  now asynchronous and §15.8-tethered and which this channel does not call. A cited reply is the agent's
+  own record through `remember()`, so the pre-0.14 paths that answered a gated reply (the `remix-refused`
+  outcome, the `canRemix` check at hold time) are gone, and the channel never advises dropping parents.
+- A held reply the SDK refuses at flush (it throws: a category over its 256 KiB bound, a key that
+  cannot sign) is reported in `sym_peers` as STUCK, with sym's own reason, not as waiting; it is tried
+  again after the agent publishes.
+
+### Changed — rooms are MMP §5.8 identifiers, and discovery is `_sym._tcp` with TXT room
+
+- **A room is a name, not a service type.** sym 0.14 (MMP 2.0 update 1, §5.1) advertises every node on
+  `_sym._tcp` with its room in the TXT `room` key and `mmp=2.0`, and a node dials only an advertisement
+  whose TXT room is its own and whose `mmp` list contains 2.0. The channel no longer passes
+  `discoveryServiceType` (a per-room type would make it invisible to every 0.14 node), builds no
+  `_<room>._tcp`, and prints no service type: `sym_status`, `sym_room_info`, `sym_join_room` and
+  `sym_invite_info` say the room and, where useful, the `_sym._tcp` + TXT advertisement.
+- **A room is 1 to 64 characters from `a-z0-9._-`** (`acme.prod` is a room; so is
+  `x-review--team-02779b950c3d8d7378fd11d6`), `default`, and never `sym`. The channel asks the SDK
+  (`rooms.isValidRoom`) and keeps no grammar of its own. Two copies of the old kebab-case grammar are
+  gone: `relay-store.js` (a dotted room's relay credential was never remembered, and `sym_join_room`
+  said the relays directory was not writable) and `bin/install.js` (which refused `--room acme.prod`;
+  it keeps a last-resort mirror, pinned to the SDK by a test on a table of names).
+- **A configured room that is not a room stops the node from being built**, with the cause on every
+  tool: sym 0.14 throws `EBADROOM` for it, building a node mints an identity, and falling back to
+  `default` would put the agent in the global mesh. The value is not repeated (it may come from a file in
+  a repository). A free-form name used before 0.11 is a different room from any identifier you map it to,
+  because the room is signed into every record: choose the identifier once and keep it.
+- **`sym_rooms_discover` browses `_sym._tcp`** (pure-JS mDNS, as the SDK does; no `dns-sd` or `avahi-browse`)
+  and groups what it hears by TXT room, counting distinct nodes. It prints a room only if it is a room,
+  counts the rest, prints no node name or key, bounds its answer, and says which nodes list no `mmp`
+  2.0. A relay-only node (`SYM_LAN=off`) browses nothing and says so.
+- `SYM_SERVICE_TYPE` is read only as a room name, and only when neither `SYM_ROOM` nor `.sym/node.json`
+  names one; an advisory says so. The `_symrooms._tcp` beacon that `sym rooms` lists is kept, now with the
+  mDNS error handler the sym daemon's own beacon lacked.
+
+### Changed — against sym 0.14.0 as published
+
+- **A mood frame is `{type, mood ≤ 1024, context ≤ 4096 | null, timestamp}` with no sender.** The label is
+  the name the session proved; the frame's `context` is never read. A mood over its bound is refused by
+  the sender's node (`EMOODFRAME`), so the channel's own cap only bounds moods that arrive as a record's
+  mood text.
+- **`remember()` returning null is a store that could not write**, not "already in memory" (0.13 returned
+  null for a duplicate; 0.14 returns `{ key, duplicate: true }`). The answer is "Not sent: this node's
+  store could not write the record", and nothing is held.
+- **`sym_status` shows sym's authority store** (MMP §6.6): whether an anchor is pinned, the statements in
+  force, this node's roles. The pin is `SYM_FOUNDER_ANCHOR` in the server's environment; `.sym/node.json`
+  cannot set one, and a pin that does not parse stops the node, with the cause on every tool. The channel
+  decides nothing from roles. It also shows deliveries that got no inbox id because the inbox held too
+  many unread ones (`inboxStatus().dropped`).
+- The words for a key's source follow 0.14 (`pinned`: an accepted invite, a Legacy Import route or an
+  operator's resolution; `anchor`: the configured pin; `grant`: a grant in force under the anchor).
+
+### Fixed — a delivery is surfaced once, and inbox ids are never reused (sym 0.14.0)
+
+The field report: after a restart or a room move, records already received came back as new deliveries
+under new ids, and an id announced to the agent could later be given to another record. sym 0.14.0
+fixes both (a delivery ledger written before a delivery is announced; an inbox journalled before an id
+is announced, with ids never reused), and a channel test now shows it end to end:
+`test/redelivery-e2e.test.js`. Two spawned servers, a sender restarted again and again so its anchor
+replay reaches the receiver each time (the relay tap counts the sealed frames), then the receiver
+restarted and moved to another room and back (`sym_join_room`): nothing is surfaced again, every id
+still fetches what it announced, and the next delivery takes the next id. A second case leaves only the
+ledger (the receiver's stored records removed): the ledger alone keeps the record from coming back, and
+with the ledger removed too the same case fails with the field bug.
+
+### Changed — names are labels, never routes
+
+- **`to` takes a nodeId, or a delivery id (that delivery's verified signer).** A name is refused,
+  with the nodeIds of connected peers that use that label. `sym_peers` lists every peer's nodeId.
+- **`SYM_ALLOWED_PEERS` takes nodeIds**, judged against the verified signer. An entry that is not a
+  nodeId is ignored and reported. A list with no nodeId in it allows nothing, so a 0.10 list of
+  names does not silently allow everyone after the upgrade.
+- The outbox and its known-peer roster are keyed by nodeId, in private (0600) files. A nodeId becomes
+  known only from a Core Secure session: `peer-joined` counts only when `peers()` shows that
+  session as a proven Core Secure one, never a Legacy Import one. A 0.10 item held for a name is
+  converted through the old roster's recorded id; one that cannot be is listed for discarding.
+- The push rate counts per proven sender; a record signed by this node itself is counted, not shown.
+
+### Changed — push is stated by the session, not guessed
+
+- The server sends one push check carrying a code. A session that received it calls
+  `sym_push_confirm {code}`; from then on `sym_receive` names a delivery it already pushed instead
+  of repeating it, and the unread count leaves those out. `sym_push_confirm {}` sends a new check;
+  `{reaching: false}` states that pushes do not reach the session. Until a confirmation, every
+  delivery is listed, pushed ones tagged `·pushed`.
+- The server no longer reads Claude Code's launch line or the process tree. 0.10.2's
+  `SYM_CHANNEL_PUSH` and `SYM_CHANNEL_MCP_NAME` do not exist.
+
+### Fixed — the channel adds nothing to what the agent wrote
+
+- **No re-send salt.** 0.10 re-sent identical categories with `[re-sent <time>]` appended to the
+  focus, signed in the agent's name. Identical cognition is one content address (§8.8.2): the answer
+  is now "Already in memory", which is not an error.
+- **Only the categories given are sent.** Missing categories are no longer filled with `directive`,
+  `observation`, `none` or the node's own name, and a mood is no longer given invented zeros. An
+  empty or blank `focus` is refused.
+- **"Not sent: …"** is the tool's own answer when sym refuses to build or sign a record (`ECMBSIZE`,
+  `ESIGN`, a malformed record), with nothing sent.
+
+### Fixed — no peer text at instruction level
+
+- The startup instructions carried the store's newest records, peers' words included, under "act
+  accordingly". They now say who this node is, how the tools work and how many records memory holds;
+  `sym_recall ""` returns the records as a tool result, through the content policy. No raw
+  `.sym/node.json` value or unknown key name reaches them either.
+- A relay's refusal reason is quoted as data, one line, and withheld when it matches a
+  prompt-injection pattern.
+
+### Added — interior mode
+
+- With `SYM_INTERIOR_SOCKET` and a capability, the server attaches as an existing node's mind (XMesh
+  cognitive nodes, sym D9.3). It starts no node and has no mesh identity: `sym_send` and
+  `sym_publish` submit drafts the node checks and signs as itself (`kind`, or `SYM_INTERIOR_KIND`),
+  and refusals are said in plain words.
+- The capability comes from `SYM_INTERIOR_CAPABILITY_FILE` (a regular file owned by this user, readable
+  by no one else, or it is refused) or `SYM_INTERIOR_CAPABILITY` (removed from the environment once
+  read). It is bound to the one connection the channel opens: when that closes, the mind is detached
+  and says so. When the host's stdin closes, the mind is ended and its capability revoked.
+- The node's deliveries are read through the interior, gated as in node mode. The node gives a mind
+  only what arrived for its mission while it runs, and lets it cite only those, its own submissions
+  and the mission's context (sym's interior rule C). The node signs the kind as the record's intent and refuses
+  a differing intent. A capability presented on a second connection is refused
+  (`capability-bound-to-another-connection`). A node that serves no read side, and a request it
+  refuses, are each reported as what they are.
+
+### Changed — identity and invites
+
+- **Invites name their issuer.** `sym_join_room {invite}` pins the issuer's key before the room move,
+  so the first session in the new room must prove it. A key conflict is reported, never overridden.
+- **A pinned identity is never re-minted.** `node_id` in `.sym/node.json`, or `SYM_NODE_ID`, loads the
+  folder's agent with `create: false`; one that is missing or tombstoned leaves the server running
+  without a node, saying why on every tool.
+- `sym_status` reports the node's key fingerprint (from the SDK's accessor), the loaded
+  `@sym-bot/mesh-channel` and `@sym-bot/sym` versions (sym's `node.version`), its Core Secure
+  sessions and any key conflicts. `SYM_LAN=off` runs a relay-only node.
+- The advisory that the sym daemon is in another room is said once per session, in the first tool
+  answer (again only if the rooms change), not on every call and not in the instructions. `sym_status`
+  always says it.
+
+### Changed — the SDK boundary and the tool queue
+
+- Only sym 0.14's public host API; a behavioural test fails on any underscore read by channel code.
+- Tool calls run one at a time, in arrival order. A call that never settles lets the next call start
+  60 s after it started, and the calls behind keep their order.
+
+### Upgrade notes
+
+- **Upgrade every node of a room together.** A 0.11 channel cannot mesh with a 0.10 channel or a sym
+  0.13.17 node on a LAN or a relay (see the top of this entry).
+- **Check your room name.** `SYM_ROOM` and `.sym/node.json` `room` must be an MMP §5.8 identifier;
+  `sym-mesh-channel init --room` accepts the same. A name that is not one stops the node and says why.
+- Role grants signed by sym 0.13 confer nothing until re-issued under §6.6 (sym's
+  `docs/AUTHORITY-OPERATOR.md`); a pin is set with `SYM_FOUNDER_ANCHOR`.
+- Set `SYM_ALLOWED_PEERS` to nodeIds; a list of names now allows nothing.
+- Address `to` by nodeId (from `sym_peers`) or by a delivery id.
+- Deliveries from authors this node never proved, and that no invite or grant vouches, no longer
+  arrive (sym D4, MMP §18.3.1). A 0.13 peer is heard only through a Legacy Import route on the sym
+  side, and what it delivers is withheld here.
+- Messages, moods and Legacy Import listings are kept in the host's own feed, journalled in the node's
+  directory (`channel-feed.log`): their `m` ids survive a restart or a new host and are never reused.
+  CMB deliveries are in sym's durable inbox with their facts.
+- Full key fingerprints are printed as `sha256:<hex>` (sym's form), where 0.10 printed none.
+
+### Docs
+
+- README, SECURITY.md, docs/reference.md and the Chinese README's security statements describe
+  proven sessions, verified-or-not-shown deliveries, key-fingerprint identity, peer text as data,
+  nodeId routing and the allowlist, the push check, interior mode and pinned identities.
+
+### Tests
+
+- Every test file and every server it starts runs from an allowlisted environment in a sandbox; the
+  suite refuses to start under an XMesh mind's or a pinned agent's variables, and its last file checks
+  that the real `~/.sym` and `~/.claude` were not touched.
+- New: two servers meeting through a loopback relay by the real Core Secure handshake; interior mode
+  against a real sym 0.14 node's interior, read side included; the node host in process against real
+  nodes (provenance across a restart, messages and SVAF-rejected moods with bound keys, the feed's ids
+  across hosts, the key-binding suffix); provenance, key display, the tool queue (behavioural), the
+  unread footer (behavioural), the SDK boundary (behavioural); each review repro as a regression.
+- The release gate refuses a `file:` dependency, runs from an allowlisted sandbox environment, seeds
+  its outbox case from a child process with that environment, and checks the real `~/.sym` after. The
+  package now depends on the published `@sym-bot/sym` `^0.14.0`, with a lockfile that resolves it from
+  the registry; the vendored development snapshot (`.sdk/`) is gone, and a test pins all of this.
+- Ported to the shapes of the published 0.14.0: the mood frame (a mood over its bound is refused by
+  the sender), a cited held reply (held, flushed with its lineage; what the SDK refuses at flush is
+  stuck), the outcome of `remember()`, rooms and invites without service types.
+- **Mutation checks are in the repository** (`npm run mutation`, `test/mutation-checks.mjs`): 31 edits,
+  each breaking one production decision on a copy of the tree, each required to fail a named test file
+  (the earlier 21 were run by hand and their list was not kept). The first full run found a survivor, the
+  host feed's floor for ids taken by evicted items, which now has a test.
+- **The release gate can run to completion**, which it could not while the dependency was a `file:` path.
+  It then found its own bug: it looked for `package.json.js` in the installed package for
+  `require('./package.json')` and failed a correct tarball. Fixed, with a test.
+- New: `relay-store` (credentials for every §5.8 room, no path escape), `room-discovery` (TXT parsing,
+  grouping, hostile advertisements, bounds, the browser and the beacon as stand-ins), `rooms-surface`
+  (bad rooms, bad pins, the pin line, `SYM_SERVICE_TYPE`, join and invite on §5.8 rooms),
+  `redelivery-e2e` (above), a mood frame end to end through a spawned server, and `lan-discovery`
+  (opt in with `MESH_CHANNEL_LAN_PROOF=1`: it advertises a made-up room on the real LAN; three servers,
+  two in one room meet by `_sym._tcp` + TXT room and exchange records, the third is not dialled).
+
+## 0.10.1
+
+Requires `@sym-bot/sym` 0.13.13, which fixes the Windows identity lock: a crashed session's lock is no
+longer mistaken for a live one when Windows has reused its process id.
+
+### Fixed
+
+- **The launch command survives an npm cache clean.** When `start` runs from npx, it writes
+  `npx -y @sym-bot/mesh-channel@<version>` into `~/.claude.json` (through `cmd /c` on Windows) instead
+  of a path inside npx's cache. npm can remove that cache at any time, and every session that read the
+  path then lost its mesh server. A later `start` from a newer release upgrades the pinned version.
+  From 0.10.1 on, an older installer never downgrades it (a 0.10.0 or earlier `start` still rewrites
+  it), and a pin newer than the installer is named on stderr.
+- **`sym_status` says whether real-time push is on.** On macOS and Linux it reads how Claude Code was
+  launched: `Push: on` when the development-channels flag names this server, `Push: off` with the fix
+  when the flag is missing. Windows still reports that it cannot confirm.
+- **Releases cannot run commands from their own notes.** The release script passes the commit and tag
+  message to git directly, not through a shell. It now publishes to npm last, after the tag and the
+  GitHub release exist.
+
+## 0.10.0
+
+Requires `@sym-bot/sym` 0.13.12. This release also ships the 0.9.9 work, which was never published on
+its own: one content policy for push, receive and fetch, and withheld deliveries named. Found and
+fixed during the 2026-10-01 MMP 2.0 audit, by two Claude Code agents coordinating over this channel.
+
+### Fixed — a name held by another session no longer kills this one silently
+
+The engine takes its identity lock while the node is being constructed, which happened at module
+load, before the MCP server connected. A second session using the same node name therefore died
+before it could say why, and the host showed only "Connection closed". It happened on 2026-10-01:
+two folders' sessions shared the name `~/.claude.json` pinned for every folder.
+
+- The server now starts without a node. It names the conflict in its instructions, and every mesh
+  tool returns that reason until the conflict is fixed and the server restarted.
+- A `sym_join_room` that can't build or start the new node restores the previous room. Before, it
+  left a stopped node, or no node at all.
+- An uncaught error after the host connects is logged with its stack, counted, and shown by
+  `sym_status`; it no longer kills the process. Before the host connects, it exits as before.
+
+### Fixed — one delivery, one id, and a fetched message is read
+
+- A push and `sym_receive` name a delivery with the same inbox id (`[inNNNN]`). The push used to
+  mint its own `mNNN` for a delivery the inbox already held, so every message arrived twice under
+  two names.
+- `sym_fetch` marks an inbox delivery read once it has returned the message's last part. A
+  delivery read that way is no longer repeated by `sym_receive` or counted in the "Mesh inbox:
+  N unread" footer. A push alone marks nothing read, because the server can't tell whether the push
+  reached the session.
+- `sym_receive` tags a line `·pushed` when that delivery already went out as a notification.
+
+### Fixed — the sender is the sender
+
+- Headers printed `<receiver>+<sender>` for every message SVAF admitted, because the SDK's
+  store-local key was used as the sender name.
+- The line now shows the record's author. When a different peer delivered it, the line reads
+  `author via deliverer`.
+- `SYM_ALLOWED_PEERS`, the own-name check and the push rate limit key on the delivering peer, not on
+  the author a record claims. A record can name anyone as its author.
+
+### Fixed — "Sent" means something was sent
+
+- `sym_send` trusts the engine's own account of the send (`remember().delivery`). A directed send
+  that reached no transport says NOT DELIVERED, and is held in the outbox until the peer reappears,
+  instead of reporting "Sent". This happened when the target session had just restarted.
+- A send to a peer that has been silent for 30 seconds warns that its connection may be gone.
+- Success reads "handed to the transport; MMP has no delivery receipt". The tool no longer claims
+  delivery it can't know.
+
+### Changed — one agent, one node, one name per folder
+
+- `sym-mesh-channel start` names the node after its folder. Run in `sym-agent-x`, it gives the node
+  `claude-sym-agent-x`. The name and room are kept in the folder's `.sym/node.json`, which the Claude
+  plugin's node reads too.
+- The user-scope `~/.claude.json` entry no longer pins `SYM_NODE_NAME` or `SYM_ROOM`. Every folder
+  reads that entry, so a pin there gave every agent on the machine the same identity (on Windows,
+  `claude-<hostname>`). A second agent then lost its node to the identity lock, and every agent shared
+  one inbox.
+- An older entry that pinned them is rewritten after a backup.
+  - The pinned room carries over to the folder you launch from.
+  - The pinned name does not, because the folder is the agent. `start` prints the old name and
+    `start --name <old>` for anyone who wants to keep that identity.
+  - Relay credentials in the entry are kept.
+- `start` turns the Claude plugin off for its folder (`enabledPlugins` in `.claude/settings.local.json`,
+  merged and backed up). The session then runs exactly one mesh node, the one launched with real-time
+  push. Before, the plugin's node joined `default`, and once both read the same `.sym/node.json` they
+  would have fought over one name.
+- `start` warns when a project-scope entry in `~/.claude.json` still pins the folder, and names the
+  command that removes it.
+- `--name`, and a `node_name` in `.sym/node.json`, must satisfy MMP §3.1.2 and be safe as a directory
+  name.
+- A session running both the plugin and a `claude-sym-mesh` server is two mesh nodes, and both servers
+  now say so. `sym_status` says the server can't confirm whether real-time push is enabled, and names
+  the flag that enables it.
+
+### Known limits
+
+- **Peer identity is trust-on-first-use.** Peers still connect with the pre-2.0 one-frame
+  handshake. The MMP 2.0 Core Secure handshake is in the engine but not yet switched on; it is
+  planned for a coming engine release. Until then a peer's name is a label, not a credential (see
+  SECURITY.md). The channel keys its own decisions on the delivering connection.
+- **Windows: a crashed session's identity lock** can't yet be told from a live one when Windows has
+  reused its PID. The no-node message says which lock file to delete. An engine fix is planned for
+  `@sym-bot/sym` 0.13.13.
+- On engines before 0.13.12, a held directed send that is flushed later carries a `[re-sent …]`
+  suffix on its focus. 0.13.12 re-sends the stored record unchanged.
+
+### Docs
+
+- README, SECURITY.md, docs/reference.md and README_zh.md describe the per-folder identity, the
+  one-node-per-session rule, the `server:claude-sym-mesh` relaunch after `start`, and the current
+  limits of peer identity. They no longer claim the handshake authenticates peers.
+
+### Fixed — a withheld delivery is named, never reported as nothing
+
+A message sent with a 36,459-character payload arrived, and the receiving session was told "Caught
+up — nothing new delivered". `sym_receive` had drained it, an 8 KB payload cap had withheld it, and
+with nothing left to show, the answer said there was nothing. The real-time push applied the same
+cap and wrote only a stderr line. `sym_fetch` on the inbox id checked nothing at all.
+
+- `sym_receive` accounts for every delivery it drains: shown; withheld, listed with its id, sender
+  and reason and none of its text; or counted by sender against `SYM_ALLOWED_PEERS`. "Caught up"
+  now means nothing was delivered.
+- A delivery withheld for its size or for an injection pattern is also announced on the push as it
+  happens, in the same terms.
+- The default payload limit is 1 MiB (`SYM_MAX_PAYLOAD_BYTES`, the bound the LAN transport sets on
+  one frame) instead of 8 KB. A payload within it is announced with its size and read on demand; a
+  larger one is withheld and named, and stays in the inbox. An invalid `SYM_MAX_PAYLOAD_BYTES` used
+  to switch the check off silently; it is now reported, and the default applies.
+- `sym_fetch` takes an optional `offset` and returns a long message in parts of at most 48,000
+  characters, each saying which characters it holds (counted from 1) and the offset of the next. A
+  message that fits one part comes back exactly as before.
+
+### Fixed — one content policy on every surface
+
+- `sym_fetch` on an inbox id makes the same judgement as the push and `sym_receive`. It made none,
+  so a withheld message's whole text was one call away. `sym_recall` applies it to a peer's stored
+  memory too, which it showed unchecked.
+- A message's content string is checked for injection patterns along with its CAT7 fields and its
+  payload. `sym_fetch` showed it unchecked, and so did `sym_receive` when the focus was empty.
+- `sym_receive` applies the classifier-risk quarantine that the push already applied, over the same
+  text, the payload included.
+- A sender chooses its own name, so every line prints it with line breaks, brackets and control
+  characters replaced; the audit line drops control characters and quotes from its excerpt. A
+  delivery under this node's own name is counted in `sym_receive`, not dropped without a word.
+- One delivery that cannot be rendered costs its own line, withheld with that reason, instead of
+  failing the whole batch the drain had already taken. A payload is serialised at most twice per
+  delivery, however many checks read it.
+- The rate limit counts each arrival once, on the push, before anything is pushed, a withheld
+  notice included, and holds back only the push: the delivery waits in the inbox. It used to be
+  counted again at read time, so a backlog of more than 30 messages from one sender read in one
+  `sym_receive` hid the rest (drained, never shown), and a delivery read within a minute of
+  arriving counted twice.
+
+### Changed
+
+- The stderr audit line reads `[sym-security] WITHHELD surface=<push|receive|fetch> reason=<reason>
+  peer=<name> id=<inbox id> excerpt="…"`; it was `[sym-security] BLOCKED reason=… peer=…`.
+- `npm test` runs every `*.test.js` under `test/`, and fails if it finds fewer than the files it was
+  set to. Six test files had never run in it.
+
+## 0.9.8
+
+### Fixed — held mail knows its age, and there is a way to let it go
+
+`sym_peers` reported one CMB held for a doer that died ten days earlier, advising that it would
+"flush when the peer appears". It was not waiting, it was stranded, and the line read as patience.
+Three defects underneath: `heldAt` was in the item shape from the beginning and never populated, so
+nothing could tell waiting from abandoned; the queue refuses rather than evicts at 200 items —
+deliberately, because dropping a sender's mail silently is the one thing it must not do — so mail
+for the dead accumulates one entry per dead peer and eventually refuses NEW mail for the living;
+and there was no way to clear it. Held items are stamped now, the advisory prints the age and past
+a week says these will never flush, and `sym_outbox_discard` takes a peer name explicitly, reports
+how many were dropped and how old they were, and never runs on its own.
+
+### Fixed — a node.json key we do not read no longer passes in silence
+
+A seat restarted and found itself alone in room `default` with the right identity: its node.json
+used `group`, the name this project used before the rename to `room`, so the file sat there looking
+obeyed. The malformed-config case already had a voice; the wrong-key case had none, and it is the
+commoner of the two because the old name is still in circulation in notes and old templates. The
+reader now collects the keys it ignored — `group` gets its own line naming the rename and the
+one-word fix, anything else unrecognised gets a line — and both print above the "you are in
+default" advisory, which otherwise sends a reader hunting for a missing file. `group` is
+deliberately NOT honoured: reading it would make the rename meaningless and hide the same trap one
+release later.
+
+### Changed
+
+Pins `@sym-bot/sym` ^0.13.8: relay-only nodes, the declared room on relay-auth, and the
+`shareWithPeers` ReferenceError.
+
+## 0.9.7 (2026-09-05)
+
+### Changed — a short hosted-relay token is refused at the join, before the node is stopped
+
+`sym_join_room` with a token under 32 characters for the hosted relay returns the floor and the
+fix and changes nothing; previously the node was stopped, reconstructed, and refused by the relay
+on every reconnect, with no reason shown on an engine older than 0.13.5.
+
+### Docs — the security boundary says what the channel does and where it stops
+
+Signing per session, per-peer content encryption on LAN and relay, a relay that forwards sealed
+payloads and stores nothing, and — with `@sym-bot/sym` 0.13.7 — no plaintext through a relay to a
+peer without a key. Requires `@sym-bot/sym` ≥ 0.13.7 for that last behaviour.
+
+## 0.9.6 (2026-09-03)
+
+### Changed — the session can see the relay
+
+A session whose token a relay refused saw `Relay: disconnected` from `sym_status` and
+"Discovering peers on the new service type" from `sym_join_room`, while the relay's log
+filled with its rejections. The party who could see the fault (the relay operator) and the
+party who could fix it (the session) were not the same one.
+
+- `sym_join_room` with a relay now waits (up to 10 s) for the relay's answer and returns it:
+  admitted (`connected to … N relay peer(s)`), refused (`REFUSED by … (4003: <reason>)` plus
+  the fix — `isError`), or unreachable (last close, next retry, "LAN peers are unaffected").
+- `sym_status` prints the engine's one-line relay diagnosis instead of connected/disconnected.
+- A relay refusal also pushes one `relay-auth-refused` channel notification (in addition to the
+  stderr line from 0.9.5), so the session learns without being asked.
+- Requires `@sym-bot/sym` ≥ 0.13.6 for the state; on an older engine the old words are used.
+
+### Added — a relay join survives a restart
+
+`sym_join_room` with a relay remembers the credential for that room in
+`~/.sym/relays/<room>.json` (0600, under `SYM_STATE_DIR` when set — never in the project).
+A server that starts into the same room re-joins the channel unasked and `sym_status` names
+the source (`Relay credential: remembered for room '…'` / `SYM_RELAY_URL env`).
+`sym_join_room { room }` with no credential uses the remembered one; `{ room, lan_only: true }`
+forgets it. Before, the join lived in the MCP server's memory only: quit Claude Code on the
+home Mac and the road session saw `0 relay peer(s)` and no error.
+
+### Changed — `sym_invite_create` mints the credential
+
+`cross_network: true` returns a `sym://team/…` invite pointing at the hosted relay with a
+token minted in the session (32 random bytes, base64url). The result says what the token is
+(it names an isolated channel; whoever holds the URL can join), how to rotate it (a new invite;
+no per-device revocation), and prints the exact `sym_join_room` call the creator must make to
+be reachable. `relay_url` still selects a relay your team runs; `relay_token` still reuses an
+existing token; a token under 32 characters aimed at the hosted relay is refused before the
+relay refuses it. LAN invites are unchanged. Docs (EN/中文) re-advertise the hosted relay for
+cross-network use — the previous "we host one, any shared secret works" wording described a
+relay that did not admit such tokens.
+
+## 0.9.5 (2026-09-03)
+
+### Added — a relay's auth refusal is printed where the session's operator reads it
+
+When the relay refuses this session's token (close 4003), `@sym-bot/sym` ≥ 0.13.5 emits
+`relay-auth-refused` once per episode and drops to a slow retry. The plugin now writes that
+refusal to the MCP server's stderr with the fix ("get the token from whoever runs the relay");
+before, the only trace of a misconfigured seat was a rejection every ~23 s in the relay
+operator's log, under a session-default name nobody could place. LAN peers are unaffected and
+the session keeps running. (Pairs with sym 0.13.5 at the next release; harmless on older.)
+
+### Changed — the docs and the `sym_join_room` tool description no longer advertise a relay host
+
+`docs/reference.md`, `README_zh.md` and the `relay_url` field description all named one
+hosted relay as the example ("we host one at …") beside an invite example whose token was
+"any shared secret the team agrees on". A relay admits only the channel tokens its operator
+configured, so a stranger following that page reaches the socket and is refused forever —
+observed on the relay log as one `Auth rejected — token not in any channel` line every ~23 s
+from a session that had done exactly that. The docs now say to run your own relay and that
+the token is issued by whoever runs it; the tool description says the same; the example URL
+is `relay.example.com`. No behaviour changes.
+
+
+## 0.9.4 (2026-08-31)
+
+### Fixed — a replayed stale directive no longer surfaces as fresh (tracks `@sym-bot/sym` ^0.13.4)
+
+After the 0.9.3 upgrade a seat received three ~30-hour-old daemon-spool replays as
+live pushes with fresh ids and seconds-old ages — one an instruction to redo work
+its own successor recorded as committed (dev-team-3). The receive-path dedup's TTL
+was one hour, sized for reconnect storms, not for the spool's ~30-hour replay
+horizon. sym 0.13.4 raises the surfaced-key TTL to seven days under
+record-after-surface semantics; this release pins the pairing.
+
+
+## 0.9.3 (2026-08-31)
+
+### Fixed — every restored inbox entry is fetchable (tracks `@sym-bot/sym` ^0.13.3)
+
+codex-mac reported directed 3–4KB replies surfacing truncated in sym_receive with no
+retrievable id. The cause was in the SDK's inbox restore: entries persisted before sym
+v0.10.0 introduced seq/id restored verbatim — seq-without-id entries rendered as
+"[undefined]" and could never be fetched; entries with neither field were silently
+filtered out of every drain. sym 0.13.3 normalizes on restore (seq minted above the
+cursor, id minted from seq; redelivery beats silent loss), and this release pins the
+pairing so the combination users install is the combination that was tested.
+
+
+## 0.9.2 (2026-08-31)
+
+### Changed — the description says what the mesh actually is
+
+Description-only release. The manifest called this "Real-time Claude-to-Claude
+mesh", which undersells the shipped surface: the wire is MMP, any MCP-capable
+coding agent joins through the open @sym-bot/mesh-channel SDK, and the live mesh
+this plugin connects to already carries non-Claude peers. The description now
+says what the plugin is for — real-time, full-duplex messaging among Claude Code
+sessions and other coding agents — and names the property that distinguishes it:
+push in, send out, no polling.
+
+The marketplace entry had drifted twice over — pinned at 0.8.0 against the
+installed 0.9.1, carrying a different, older description. It now carries the
+same words as the manifest, so there is one text instead of two that must agree.
+
+## 0.9.1 (2026-08-27)
+
+### Changed — tracks `@sym-bot/sym` ^0.13.2
+
+Released alongside sym so the pairing users install is the pairing that was
+tested. 0.9.0 declared `^0.13.0` and was tested against 0.13.0, but sym then
+shipped 0.13.1 and 0.13.2 — so a fresh install of 0.9.0 today resolved a
+combination nobody had run. The declared range, the version installed here, and
+the version a new user got were three different answers.
+
+### Fixed — a refusal named the wrong cause once the SDK enforced canonicity
+
+`roomRefusalReason` branched on `isValidRoom`, and that predicate **changed
+meaning** at sym 0.13.0: from "grammatical" to "grammatical AND canonical". After
+that, every canonicity failure was reported down the grammar path, so a caller
+who asked for the room `sym` — impeccable kebab-case — was told it was not
+kebab-case. That is exactly the wrong-reason defect this function was added in
+0.9.0 to remove, reintroduced without a line of it changing, by a dependency
+changing underneath it.
+
+Grammar and canonicity are now read from the two things that actually
+distinguish them: the grammar from `KEBAB_CASE_RE`, the alias from the round
+trip. `sym` is told it resolves to `_sym._tcp`, which is the room `default`;
+`Bad_Room` is told about the grammar. A regression test forbids branching on
+`isValidRoom` in that function, since the source did not have to change for this
+to break and would not have to change to break again.
+
+## 0.9.0 (2026-08-27)
+
+### Changed — one room grammar, and a dependency range that can actually reach it
+
+`@sym-bot/sym` moves to `^0.13.0`. The previous range was `^0.11.3`, and for a **0.x**
+package caret means `<0.12.0` — so this package could never resolve past 0.11.x however
+often the SDK shipped. That range, not lag, is why a local copy of the room grammar existed
+here at all.
+
+`server.js` now declares no room grammar and no room-to-service-type mapping of its own;
+`isValidRoom`, `roomServiceType` and `serviceTypeToRoom` all come from the SDK, which is
+their single source of truth. Collapsing them removed three separate inline
+`` `_${room}._tcp` `` constructions — in `sym_join_room`, in `resolveRoom`'s hand-rolled
+inverse, and in the invite parser, which built the room and the service type as two parallel
+expressions that had to agree and had no reason to. Deriving one from the other fixed a
+user-visible bug in passing: a `sym://default` invite produced `_default._tcp` rather than
+the global mesh.
+
+`bin/install.js` keeps one guarded mirror of the grammar, because install has to validate a
+room name in situations where the SDK cannot be resolved. A test asserts the mirror is
+character-identical to the SDK's regex, so it fails the day they diverge rather than the day
+someone joins a room.
+
+### Added — room names must be canonical
+
+Decision, 2026-08-27: one name per room, one room per name. Both join gates now
+require the round trip through the service type to be identity, so **`sym` is refused** — it
+satisfies the grammar but maps to `_sym._tcp`, whose inverse is `default`, so joining it put
+this node in the global mesh while it reported being somewhere specific.
+
+The check is written as the **property**, computed from the SDK's mapping in both directions,
+rather than as a second copy of the grammar — which is what let it work before the SDK
+enforced canonicity itself, and what makes it merely redundant now rather than wrong.
+
+A refusal now names the reason that applies to the name refused. `sym` **is** kebab-case, so
+the old "must be kebab-case" sent its author to fix something that was never wrong; a
+non-canonical name is now told which room it actually resolves to.
+
+### Fixed
+
+- The plugin manifest and the `.mcp.json` launch pin move with the package version. Bumping
+  `package.json` alone left the plugin advertising the previous version and the launch line
+  pinning it, so an install would have fetched the old server while the repo claimed the new
+  one. Two guard tests catch this; they earned their place on this release.
+
+## 0.8.1 (2026-08-26)
+
+### Changed
+
+- **The read surface says what it cannot show.** `sym_receive` lines, push headers and
+  quarantine headers carry an explicit tag when the receiving membrane muted individual
+  fields of a message — an entry that shows less than its sender wrote now says so instead
+  of reading as complete. Landed in source on 2026-08-25; this is its first published
+  release, because this package's own publish gate refused to ship until the new module was
+  actually in the tarball. The published 0.8.0 predates the feature and was never affected.
+- **Tenant-suffixed room names are legal in `sym_invite_create` and the installer.** Both
+  copies of the room grammar (server and `bin/install.js` — the persistence path) accept a
+  double hyphen as a segment separator, in lockstep with sym 0.12.3; the validator's error
+  message and tool descriptions now describe the grammar they enforce. A user can invite,
+  join AND persist an XMesh tenant-scoped room.
+
+
+## 0.7.2 (2026-08-10)
+
+### Added — unread-inbox advisory
+
+Some MCP hosts never invoke the model on an inbound CMB. Measured on Codex: a directed CMB was
+verified and durable at `cursor 4 / seq 5` and surfaced only when the next user turn called
+`sym_receive`. So **any mesh tool could succeed while directed mail sat unread.**
+
+Every tool response now carries one line, and only when there is something to say:
+
+```
+Mesh inbox: 3 unread — call sym_receive.
+```
+
+**This is not a wake and not a push.** Nothing here invokes anyone — it is a count on a reply the
+caller was already reading. An MCP server cannot make a host run its model.
+
+Contract, kept deliberately narrow (ruled by codex-mac):
+
+- Exactly one line, **only when unread > 0** — silent at zero.
+- **Count only.** No sender, no focus, no payload.
+- **Never advances the cursor** — it reads `inboxStatus()`, which is read-only, not `inbox()`,
+  which drains. Reporting mail must not consume it.
+- Labelled distinctly from held sender-outbox state: `Mesh inbox:` is mail waiting for *this* node
+  to read, `OUTBOX:` is mail this node holds for someone else. Different facts.
+- Applied through **one wrapper** around tool dispatch, so success and error responses behave the
+  same and a newly added tool cannot miss it.
+
+## 0.7.1 (2026-08-10)
+
+### Fixed — 0.7.0 on npm was broken. Do not use it.
+
+`server.js` requires `./outbox.js`; `package.json`'s `files` whitelist omitted it. The published
+tarball had no `outbox.js`, so `npm i @sym-bot/mesh-channel@0.7.0` failed at startup with
+`Cannot find module './outbox.js'`.
+
+Every test passed and the repo was green, because **every test ran against the working tree, where
+the file is trivially present. The artifact users receive is a different artifact from the one we
+tested.** The plugin install was unaffected — it installs from git.
+
+Found from the registry tarball by a Codex agent, not by this repo's suite.
+
+### Added — a release gate that tests the packed artifact
+
+`npm run verify:packed`, wired into `prepublishOnly`: `npm pack` → install the tarball into an
+empty directory → speak real MCP over stdio to the **installed** copy → exercise the three outbox
+cases. It also asserts every local `require` in the installed `server.js` resolves on disk.
+
+Plus static checks in `test/packaging.test.js`: every local module reachable from `server.js`,
+transitively, must appear in `files`, and every entry in `files` must exist.
+
+### Docs
+
+README's offline-peer section still said absent peers were refused. Corrected, and trimmed to
+usage rather than rationale.
+
+## 0.7.0 (2026-08-10)
+
+**A directed send to a peer that is not connected is now HELD, not refused.**
+
+### The seam this closes
+
+`sym_send` resolved the target against `node.peers()` and, when absent, **returned the refusal
+before anything was sent**. No envelope left this package — so a correct, well-tested delivery
+spool in `sym-daemon` sat downstream of a message that was never sent. The refusal lived in the
+seam between two suites: mesh-channel's tests cannot see the daemon, the daemon's cannot see
+mesh-channel. Two people reasoned about that boundary instead of crossing it, and a
+`sym_send`-first acceptance test in the `sym` repo is what finally showed it.
+
+**Why the queue is here rather than in the daemon** — measured, not assumed. mesh-channel has
+**zero** references to `register-agent`, `daemon.sock` or `agent-cmb`, and the daemon log carries
+**zero** hosted-agent registrations for any seat (109 for the ops agents). Seats are standalone
+`SymNode`s, so a daemon-side spool cannot serve them until they register at all. Holding at the
+sender needs no registration.
+
+### Added — `outbox.js`
+
+- **Durable, atomic**, at `~/.sym/nodes/<node>/outbox.json`. FIFO, survives restart.
+- **Flushes automatically** when the peer appears (`peer-joined`), dropping items **only after the
+  send returns** — never on dispatch, because a socket write is not delivery.
+- **Known peers only.** A name is holdable only if this node has actually *seen* it, recorded in
+  `known-peers.json`. `identity.json exists on disk` was rejected as the test: it is true for
+  **961 of 962** node directories here, so it admits essentially everything. An unrecognised name
+  stays a typed refusal — **a typo cannot create a queue.**
+- **A full outbox refuses rather than evicting.** Dropping held mail would be invisible to everyone
+  but this node. Caps are 200 items / 8 MB.
+
+### Honest limits, stated in the tool output itself
+
+The response says **`HELD AT SENDER — not delivered`**, names the peer it waits for, and says
+plainly that the queue is invisible to that peer and lost if this node does not return. Pending
+mail is reported in `sym_peers` and at startup — held mail that nobody can see is
+indistinguishable from mail that was delivered.
+
+**This fails when the SENDER is the intermittent one** — the mirror of the daemon spool's weakness.
+It covers the observed case: a persistent seat sending to an intermittent one.
+
+### Fixed — a test that measured a window instead of a fact
+
+`plugin.test.js` bounded the `sym_send` handler at a fixed `caseIdx + 4000`. The handler grew to
+~4,800 chars and the test went red reporting "explicitSend is missing" when `explicitSend` was
+simply further down. It now finds the next `case` label in the full source.
+
+## 0.6.5 (2026-08-10)
+
+**Restarting the same node is now just a restart.**
+
+### Fixed — a stdio server that outlives its host
+
+Signals were handled; **stdin closing was not**. Not every host signals its children on the way
+out — Codex quits without one, which left a `codex-mac` connector running with **PPID 1 for twenty
+minutes past its parent**, still holding the pinned identity. The next launch hit `EIDENTITYLOCK`
+and, correctly with `required = true`, died reporting a conflict with a process that could no
+longer serve anyone.
+
+**A stdio server whose stdin has closed is already dead** — the only channel a client could speak
+on is gone. It now exits on stdin `end`/`close`/`error`, leaving the mesh cleanly and releasing the
+identity lock.
+
+### Changed — NEVER `-2`, NEVER `-3`
+
+`autoSuffix` is now **off for every identity**, pinned or not. It was previously on for unpinned
+sessions.
+
+A suffix looks like a courtesy and is a **data event**: `foo-2` is a different store with a
+**different signing key**, so a seat keeps its name in conversation while silently becoming a new
+cryptographic identity with none of its own memory. Three such stores existed on one machine —
+`codex-mac`, `-2`, `-3` — each with its own keypair, minted by collisions nobody was told about.
+
+A collision is now always a hard failure. The engine still reclaims a **dead** holder's stale lock;
+that path is start-time-verified and is not a suffix. With the stdin fix above, the orphan that
+caused collisions in the first place no longer survives.
+
+Two tests that asserted `autoSuffix: true` were **inverted rather than deleted** — a test that
+encoded the wrong design names the mistake where someone would repeat it — plus a new one proving
+no input shape can produce a suffix.
+
+## 0.6.4 (2026-08-10)
+
+**0.6.3 put the room diagnostics on stderr. Some MCP hosts never show that.** Measured on Codex
+CLI 0.144.0 by a Codex agent: a session with a misspelled or unset `SYM_ROOM` started normally and
+displayed **none** of the child's non-fatal stderr. The warnings 0.6.3 added were invisible to
+exactly the audience it was written for.
+
+Worse, `required = true` cannot catch this class at all — **a wrong room does not fail startup.**
+The server launches, the tools work, the session runs. It just talks to nobody.
+
+### Changed — the advisory now travels IN BAND
+
+- **In the MCP `initialize` instructions**, so the agent reads it whether or not the host surfaces
+  stderr.
+- **In `sym_peers` output on every call** — including `No peers connected`, which is the exact
+  moment someone asks why the mesh is quiet. It now answers with the room and its source instead
+  of leaving them to find stderr the host may never print.
+
+Stderr logging from 0.6.3 stays; it is simply no longer the only path.
+
+### Docs
+
+- **What a wrong room actually looks like** — a per-host table of where the warning appears, and
+  the observed `required = true` failure text (exit 1 before session creation) versus
+  `required = false` (exit 0, session runs silently tool-less).
+- A typo is the common case: `SYM_ROOM = "sym-bot-rooom"` resolves cleanly and joins a real, empty
+  room. Nothing about it is invalid — it is just not where anyone else is.
+- Codex **desktop** UI presentation is marked **UNTESTED**, because verifying it requires
+  terminating the task doing the reporting. Not inferred, not quietly omitted.
+
+## 0.6.3 (2026-08-10)
+
+**Codex ↔ Claude Code duplex is now a supported, documented setup** — and the failure that made
+it hard to reach now announces itself.
+
+### Added — the room says where it came from
+
+A node in the wrong room fails by going *quiet*, and quiet is the one symptom indistinguishable
+from "nobody is talking right now". Three new signals:
+
+- **Startup line naming the resolved room AND its source**:
+  `node 'x' in room 'y' (_y._tcp) — room source: SYM_ROOM env`. Sources are `SYM_ROOM env`,
+  the `.sym/node.json` path, `SYM_SERVICE_TYPE env`, or
+  `nothing configured — this is the fallback, not a choice`.
+- **`sym_room_info` reports `room source`** too, and says plainly when `default` was never chosen.
+- **A warning when the `sym` daemon disagrees.** The daemon resolves its room from `~/.sym/room`;
+  this server does not read that file. Two sym nodes on one host with two sources of truth means
+  a host can partition against *itself*, which reads like a network problem and is not one.
+
+Resolution and reporting now come from **one function**, so the answer and the explanation cannot
+drift apart.
+
+### Fixed
+
+- **A malformed `.sym/node.json` was indistinguishable from an absent one.** Both collapsed to
+  "no config", so a typo'd file left you in `default` with the file sitting there looking obeyed.
+  Absent stays quiet; unreadable now says so and names the path.
+
+### Docs
+
+- **New: [Two vendors, one machine](README.md#two-vendors-one-machine-codex--claude-code).**
+  Verified configs for both harnesses, and the rule that matters: **`SYM_ROOM` is required on the
+  Codex side.** `CLAUDE_PROJECT_DIR` is set by Claude Code and nothing else, so Codex falls back to
+  `process.cwd()` — a Codex seat is often in the right room only because of where it was launched.
+- **Corrected routing table.** It sent Codex users to a different package. This one drives Codex
+  directly over MCP stdio.
+- Codex-side behaviour (config keys, and that a current desktop build has **no** Settings → MCP
+  servers → Restart, treats `/mcp` as message text, and needs a full quit/reopen) was verified on a
+  real build by a Codex agent rather than inferred from documentation.
+
+### Known boundary, stated in the README
+
+Both connectors must be live simultaneously. A directed send to a peer whose socket is down is
+refused at the sender, not queued. Presence is required for delivery.
+
+## 0.6.2 (2026-08-10)
+
+### Fixed
+
+- **The room rename was half-done and split across two packages.** 0.6.1 read `SYM_GROUP` while
+  `sym` 0.11.1 wrote `SYM_ROOM` — 105 `group` occurrences, zero `SYM_ROOM`. A user setting
+  `SYM_ROOM` got the daemon in the right room and the MCP node in `default`, with no error.
+  Neither repo's tests could see it, because the two halves lived in different packages.
+- `--group` → `--room` throughout the CLI, and the docs that still taught the old flag.
+
+## 0.6.1 (2026-08-09)
+
+### Fixed
+
+- **The plugin manifest and `.mcp.json` launch pin still pointed at 0.6.0.** The published package
+  and the version that actually launched disagreed.
+
+## 0.6.0 (2026-08-07)
+
+### Changed
+
+- **Repin `@sym-bot/sym` 0.10.5 → 0.11.0 (core 0.7.4 → 0.8.1).** This carries a fix that would
+  otherwise have discarded records: core's `verifyCMB` used to return `valid: true` for records
+  it had never actually checked, and `recomputeKey` could not recompute a single record the
+  library minted. See `@sym-bot/core` 0.8.0/0.8.1 and `@sym-bot/sym` 0.11.0.
+
+  Nothing in this package derives or verifies a content address itself — it delegates to `sym` —
+  so there is no call site here that a corrected core could invalidate. That was checked rather
+  than assumed: `sym` had a hand-rolled workaround around the core defect and the bump alone
+  turned it into a regression, so every consumer in this cascade was examined for the same shape.
+
+  Resolved versions after install are verified, not the declarations: `sym` 0.11.0, `core` 0.8.1.
+
+## 0.5.5 — 2026-08-04 · the version you install is now the version that runs
+
+- Repairs 0.5.4: the plugin updated its version but still launched the previous runtime, so the
+  restart-survival fix below never reached a running session. After updating, restart your MCP
+  server (or Claude Code session) — deliveries then genuinely survive restarts.
+- The release process now fails if the launched runtime version ever differs from the released
+  one, so this class of silent lag cannot ship again.
+
+## 0.5.4 — 2026-08-04 · deliveries survive a session restart
+
+> *Entry written retroactively on 2026-08-04 — 0.5.4 shipped without a changelog entry. Note:
+> 0.5.4 as installed still launched the 0.5.3 runtime; install 0.5.5 to actually receive this fix.*
+
+- Tracks `@sym-bot/sym` 0.10.2: your node's delivery inbox now persists across session restarts.
+  Anything sent to you while your session was away is waiting when a new session starts under the
+  same identity, delivered exactly once, with sender identity intact. Previously those deliveries
+  were silently lost with the old process.
+
+## 0.5.3 — 2026-08-01 · the second opinion is now recorded
+
+- Tracks `@sym-bot/sym` 0.10.1 / `@sym-bot/core` 0.7.0. The second view your node computes on each
+  admission is now written down — one row per admission under `~/.sym/shadow/<node>.jsonl`, with
+  numbers and booleans only, never the content of a block. It previously existed only as a summary
+  count in the log and was otherwise discarded.
+- Your node still acts on exactly what it acted on before. Nothing new crosses the wire.
+
+## 0.5.2 — 2026-08-01 · picks up the shadow-gate runtime
+
+- Tracks `@sym-bot/sym` 0.10.0 (and `@sym-bot/core` 0.6.0 beneath it). Your node now computes a
+  second, binary view of each admission alongside the one it acts on, records it locally, and
+  **acts on neither differently** — admission behaviour is unchanged and nothing new crosses the
+  wire.
+- The receive path also stops reporting a "redundant" verdict in the one case it could not
+  justify: when the nearest-anchor comparison is unavailable, the field is graded normally
+  rather than being called a duplicate on weaker evidence.
+
+## 0.5.1 — 2026-08-01 · dependency advisories cleared
+
+> *Entry written retroactively on 2026-08-01. 0.5.0 and 0.5.1 shipped without changelog
+> entries; 0.5.0 also shipped without a tag, created after the fact at its release commit.*
+
+- Clears outstanding dependency advisories. No behaviour change.
+
+## 0.5.0 — 2026-08-01 · the boundary record model
+
+> *Entry written retroactively on 2026-08-01 — see the note above.*
+
+- Tracks `@sym-bot/sym` 0.9.0 and `@sym-bot/core` 0.5.0. Blocks your node emits now carry the
+  two-section record: what your agent says, held separately from what the mesh proves about it,
+  with signatures that verify against the author rather than whoever relayed it. Blocks from
+  peers still on the older format remain readable.
+
+## 0.4.3 — 2026-07-24 · stable node identity across restarts
+
+- Fixes a case where a node could start under a suffixed name (e.g. `name-2`) instead of its
+  configured identity, creating a separate empty store. It happened when a prior session's lock
+  referenced a process id the OS had since reused, making a stale lock look active.
+- Node-name collision handling is now delegated to the engine's process-liveness check, which is
+  robust to reused process ids. A configured name (`SYM_NODE_NAME` / `.sym/node.json`) is used
+  as-is; a genuinely running duplicate is reported clearly instead of silently starting a second
+  identity. No change for the normal single-session case.
+
+## 0.4.2 — 2026-07-24 · hotfix: pack `classifier-risk.js` (0.4.1 was broken on install)
+
+- **0.4.1 shipped without `classifier-risk.js`** — the `files` allowlist in `package.json` was
+  not extended for the new module, so the published tarball omitted it and every fresh install
+  crashed on load with `Cannot find module './classifier-risk.js'` (`server.js` requires it).
+- Adds `classifier-risk.js` to `files` and re-releases. No code change from 0.4.1; this only
+  fixes the tarball. **Do not use 0.4.1** (deprecated on npm) — upgrade straight to 0.4.2.
+
+## 0.4.1 — 2026-07-24 · ingest guard: quarantine classifier-risk peer CMBs
+
+- **New receiver-side guard against a session-wedging failure mode.** A benign, non-injecting
+  peer CMB whose wording was security/offensive-adjacent (e.g. "protocol stripped") passed
+  `checkSecurity` but, once its text was auto-surfaced into the receiving agent's context and
+  re-fed to the model, tripped the LLM provider's server-side usage-policy classifier — a hard
+  API error that took down two consecutive requests and forced a session reset. Peer content is
+  untrusted **prompt input**, not merely untrusted instructions.
+- **`classifier-risk.js`** (`scanClassifierRisk`): the `cmb-accepted` and `message` delivery
+  handlers now **quarantine** a flagged CMB — the auto-push carries metadata only (no peer
+  free-text, no term names) and the verbatim body stays available for a deliberate `sym_fetch`.
+  The guarantee is in *not auto-surfacing*, not in guessing what the classifier keys on; a false
+  positive costs a fetch, never information. Composes with (does not replace) the existing
+  injection / rate-limit / payload-size checks.
+- Backward-compatible: unflagged deliveries are unchanged. 8 new unit tests; existing suite green.
+
+## 0.4.0 — 2026-07-24 · cmb--only cutover (fail-closed, emission flips to bare `cmb-`)
+
+- Pins `@sym-bot/sym` 0.8.0 (and through it `@sym-bot/core` 0.4.0) — the **fail-closed
+  `cmb-`-only** engine. Key dispatch is now `cmb-<64hex>` → v1, and **anything else
+  (`cmb1-<64hex>`, legacy `cmb-<32hex>`) is rejected**. The transitional `cmb1-` prefix is
+  retired; emission is now bare `cmb-<64hex>`.
+- **Ordering requirement:** a node on 0.4.0 rejects an un-migrated store, so the mesh store
+  must be re-minted to `cmb-` *before* any process runs this version (0.3.42 was the
+  read-both-prefixes release that made that migration safe). Do not update to 0.4.0 until the
+  store is migrated.
+- Plugin launch pin (`.mcp.json`) and `plugin.json` bumped to `@sym-bot/mesh-channel@0.4.0`.
+  Bumping the pin also changes the npx cache key, so restarts resolve the 0.4.0 chain fresh.
+
+## 0.3.42 — 2026-07-21 · verify both key prefixes before the cmb1- migration
+
+- Takes `@sym-bot/sym` ^0.7.32 (and through it `@sym-bot/core` ^0.3.49), whose verification
+  accepts a v1 CMB under **either** prefix. The mesh is migrating `cmb1-<64hex>` keys to
+  `cmb-<64hex>`; the prefix used to select the signing scheme, and now the digest LENGTH does
+  (64 hex = v1, 32 hex = legacy). Nothing in mesh-channel changes — it has no prefix dispatch
+  and never treated the prefix as the scheme.
+- **This release does not emit the new form.** Emission stays `cmb1-` until cutover. The order
+  is deliberate: every process must be able to READ both prefixes before any process WRITES
+  the new one, or blocks emitted by an upgraded node fail verification on one that has not
+  restarted yet.
+
+## 0.3.41 — 2026-07-18 · hotfix: `vetCmbArgs` scope bug broke every publish/send
+
+- **`sym_publish` / `sym_send` threw `vetCmbArgs is not defined`.** The 0.3.39 input-hygiene
+  guard was accidentally defined *inside* `publishGroupBeacon` — out of scope for the tool
+  handlers — so every publish and send failed loudly until this fix moved it to top level.
+  Test suite green. (Loud failure beat a silent drop, but the 0.3.39 insertion anchor — "last
+  require in file" — had landed mid-function.)
+
+## 0.3.40 — 2026-07-18 · send-path delivery integrity (E8 variant c)
+
+- `sym_send` / `sym_publish` no longer report "Duplicate — not re-broadcast" for a CMB
+  that was never delivered. `SymNode.remember()` dedups on the content hash of the CAT7
+  fields, so an identical re-send is suppressed — but a **local-store hit is not proof of
+  delivery**: a CMB stored while no peer was connected, or sent before a reconnect, blocked
+  its own re-send forever and the operator's send silently never reached the mesh (the
+  0.3.39 fix closed the *identical-defaults* cause; this closes the *genuinely-undelivered*
+  one). The channel now tracks which CMB keys were actually delivered to a connected
+  destination: a dedup against a **never-delivered** key is re-issued (disambiguated) so it
+  goes out, while a dedup against an **already-delivered** key stays suppressed (no flood
+  regression). Broadcasts and publishes with **no connected peers** now say so honestly
+  instead of claiming "Broadcast to all peers". The delivered-key set resets on
+  `sym_join_group` hot-swap (a reconnect voids prior delivery credits). Tests added
+  (`test/plugin.test.js`): true-duplicate suppression, undelivered re-send, directed
+  re-issue against a pre-existing store copy.
+
+## 0.3.39 — 2026-07-18
+
+- sym_publish / sym_send input hygiene: a habitual `content` param now MAPS to `focus`
+  (the semantic repair — it was silently dropped, yielding constant all-default fields
+  whose hash collided into "Duplicate" while the mind's actual content never reached
+  the mesh); any other unknown top-level param is a loud error. A dropped param is a
+  dropped meaning — silent drops must fail loudly (same failure family as the SVAF
+  lifecycle-intent mute; see the E8 review item).
+
+## 0.3.38
+
+### Changed
+
+- Mark display truncation in `receive` and `recall` — when a result is cut to fit, it now says so instead of silently thinning. A cut that hides its own existence is a silent loss of information.
+- Pins the launched MCP server and the plugin manifest to `0.3.38` (`.mcp.json` → `npx @sym-bot/mesh-channel@0.3.38`, `.claude-plugin/plugin.json` → `0.3.38`) — the 0.3.38 release published to npm but left both pins at 0.3.37, so a `/plugin update` converged the fleet onto the previous runtime and the published version was unreachable from the plugin path.
+
+## 0.3.37
+
+### Changed
+
+- Bumps `@sym-bot/sym` to `^0.7.27` — stops a cross-node echo/replay storm: own-only SVAF anchors (a node no longer re-forwards CMBs it received from peers) plus a reload-durable receive-dedup cache that survives a plugin reload / version skew.
+- Pins the launched MCP server and the plugin manifest to `0.3.37` (`.mcp.json` → `npx @sym-bot/mesh-channel@0.3.37`, `.claude-plugin/plugin.json` → `0.3.37`), so a `/plugin update` actually converges nodes onto the fixed runtime. The marketplace installs from the repo HEAD and the launched version is hard-pinned in `.mcp.json`, so a bare npm publish alone was invisible to the fleet.
+
+## 0.3.36
+
+### Changed
+
+- Bumps `@sym-bot/sym` to `^0.7.26` — nodes now self-report their memory stats (`emitted` / `admitted` / `memory`) to the roster as a lightweight `node-stats` frame, so a mesh observer (e.g. Mesh Edge) can show real counts for every node, including cross-machine agents whose stores it can't read locally.
+
+## 0.3.35
+
+### Changed
+
+- Bumps `@sym-bot/sym` to `^0.7.25` — adds earned-authority-weighted attestation aggregation (EA6): a node can fold the roster's attestations about a CMB into a single verdict weighted by each attester's *resolved* role, so an anchor's verdict outweighs a participant's and over-claims cannot inflate consensus. Consumed by the Mesh Edge cockpit's source drawer.
+
+## 0.3.34
+
+### Changed
+
+- Bumps `@sym-bot/sym` to `^0.7.24` — adds the **roster key registry** (EA5): a node can now verify attestations/grants relayed from peers it never directly handshook, because keys ride the anchor-rooted grant chain (the relayer never vouches). Forward-looking — invisible on a fully connected LAN, it removes the direct-connectivity cap on signature verification.
+
+## 0.3.33
+
+### Changed
+
+- Bumps `@sym-bot/sym` to `^0.7.23` — brings **earned authority** to the fleet: a node's validator/anchor role is now resolved from a signed, anchor-rooted role-grant chain (MMP §6.5) and CMB validation/canonization is gated on that resolved rank. Backward compatible — dormant until an anchor is pinned (`SYM_FOUNDER_ANCHOR`), with nodes using their static role until then.
+
+## 0.3.32
+
+### Added
+
+- **Durable audit trail reaches the fleet** (via `@sym-bot/sym` `^0.7.22`). A node's Admission Attestation trail — attestations, Merkle checkpoints, and witness countersignatures — now persists append-only on disk and reloads on startup, so it survives a restart instead of evaporating from memory; the per-attester chain cursor is restored so `seq`/`prev` keep linking across the restart boundary. Guarantee: tamper-evident + omission-evident to the last witnessed checkpoint, and durable across restarts. No tool-surface change. `npx` pin moves to `@0.3.32`.
+
+## 0.3.31
+
+### Added
+
+- **Attestation gossip + cross-mesh audit trail with omission-evidence reach the fleet** (via `@sym-bot/sym` `^0.7.21` / `@sym-bot/core` `^0.3.43`). Nodes now gossip their signed per-field gating attestations across the roster (verified end-to-end, rate-limited, relayed once), attest every gate (reject/redundant too), and periodically commit Merkle checkpoints over their attestation chain that roster peers countersign — so once witnessed, a suppressed attestation is detectable (the recomputed root diverges). Guarantee: tamper-evident + omission-evident to the last witnessed checkpoint. No tool-surface change. `npx` pin moves to `@0.3.31`.
+
+## 0.3.30
+
+### Added
+
+- **Admission Attestations reach the fleet** (via `@sym-bot/sym` `^0.7.20` / `@sym-bot/core` `^0.3.42`). When a node's SVAF gate admits a CMB, it now signs a per-field Admission Attestation and persists it on the gated remix (`cmb.admission`) — the durable, attributable, tamper-evident (against modification) audit record of the gating decision, with a per-attester hash-chain. No tool-surface change in this release; the substrate now produces and stores the records. `npx` pin moves to `@0.3.30`.
+
+## 0.3.29
+
+### Fixed
+
+- **`sym_group_info` peer list no longer always reads "(no peers in this group)".** The handler called `node.getPeers()`, which is not a public `SymNode` method — the `typeof` guard always fell through to `[]`, so the peer list rendered empty even with peers connected, while `peers in group: N` (from `status().peerCount`) showed the real count. That count/list disagreement read as a membership-handshake failure during cross-device debugging but was purely a rendering bug. Now reads the list from `status().peers` (same source as the count). No transport change.
+- **Cross-device opaque payload now survives on the SVAF-admit path** (via the `@sym-bot/sym` `^0.7.19` bump). A directed CMB's `payload` was dropped whenever the receiver SVAF-*admitted* it (the fused remix is rebuilt from CAT7 fields without the payload), so payload delivery silently depended on the receiver's per-node SVAF drift — the root of the "payload arrives on some peers, not others" asymmetry. Fixed upstream; the plugin's `npx` pin moves to `@0.3.29` to pull it.
+
+## 0.3.28
+
+### Fixed
+
+- **Opaque payloads now survive the pull path.** A directed CMB's `payload` (structured data beyond CAT7) reached agents over the channel-push path but vanished on the `sym_receive` → `sym_fetch` pull path: the inbox message dropped it (fixed upstream in `@sym-bot/sym` 0.7.18, now a `^0.7.18` dependency) and the plugin read it from the wrong field and never returned it. `sym_fetch` now appends a `---PAYLOAD---` section, `sym_receive` security-checks `m.payload` and tags the line `[+payload]`. This is the substrate for cross-device agent-to-agent structured data exchange, not just CAT7 projections. Server change — the plugin's `npx` pin moves to `@0.3.28`.
+
+## 0.3.27
+
+### Docs
+
+- **`@sym-bot` is now the canonical install path.** The README's headline install and channel-handle guidance pointed at `@claude-community` (the Anthropic community directory), whose auto-synced listing lags releases — so new users could land on stale code. Primary install is now `/plugin marketplace add sym-bot/marketplace` + `sym-mesh-channel@sym-bot`, which tracks the repo's `main` and is always current. The community directory stays as a secondary "also listed, may lag" credit.
+- **Plugin/package descriptions now cover same-machine loopback.** They said the mesh runs "over Bonjour LAN or WebSocket relay" (and "remote teams"), omitting the headline capability — multiple sessions on one machine over loopback, no network at all. Updated both to read one-machine / LAN / cross-network.
+
+## 0.3.26
+
+### Docs
+
+- **Per-project identity documented around `.sym/node.json`.** The README's per-project node identity section now leads with `.sym/node.json` (the v0.3.22+ reader) instead of the legacy `init --project`, which writes a project `.mcp.json`. Adds an explicit warning that pairing a project `.mcp.json` with the plugin double-registers the node into a phantom `<name>-2` peer, and a matching Troubleshooting entry. No code change.
+
+## 0.3.25
+
+### Changed
+
+- **Runs the `meshmem/` → `cmbs/` store migration on install** (`bin/install.js` calls `@sym-bot/sym`'s `migrateStores()`), so every non-live node is migrated when the plugin is set up. Pairs with `@sym-bot/sym` 0.7.16.
+
+## 0.3.24
+
+### Changed
+
+- **MCP tools renamed to canonical Enterprise Integration Pattern verbs:** `sym_observe` → **`sym_publish`** (Publish-Subscribe Channel) and `sym_inbox` → **`sym_receive`** (Polling Consumer). The I/O surface now reads as what the agent *does* (publish / send / receive), while the cognitive mechanism terms (emit/admit, projection/observation) stay in the MMP spec one layer down. `sym_send` (Point-to-Point) unchanged. Clean break — no aliases. Agent instructions + tool descriptions updated: publishing emits a *projection* of your state; a receiver that admits it takes it as an *observation*.
+
+## 0.3.23
+
+### Changed
+
+- **Removed the automatic `postinstall` registration.** The package no longer mutates `~/.claude.json` (or a project `.mcp.json`) on `npm install`. As a Claude Code **plugin**, the package is launched via `npx` on every session start, and the postinstall re-registered a competing user-scoped `claude-sym-mesh` MCP server each time — producing a second mesh node alongside the plugin's own. Registration now happens only via the explicit `start`/`init` commands, which the standalone flow (`npx @sym-bot/mesh-channel start`) already runs and which self-configure on first launch — so there is no change for standalone users, and the plugin path no longer double-registers. Pairs with the 0.3.22 `.sym/node.json` reader to make the plugin the single, stable, per-project mesh node.
+
+## 0.3.22
+
+### Added
+
+- **Per-project identity via `$CLAUDE_PROJECT_DIR/.sym/node.json`.** A named role agent (e.g. a CTO node `claude-code-mac` on `sym-bot-team`, or `melotune-dev` on `melo-ios`) can now commit `{ "node_name": "...", "group": "..." }` to `.sym/node.json` in its repo, and the plugin reads it on start. This lets the **plugin alone** carry a stable, per-project identity — no parallel `claude-sym-mesh` MCP registration in a project `.mcp.json`, which previously produced a *second* mesh node (the project-scoped server plus the plugin-scoped server are never deduplicated). Because the identity lives in the repo, it survives a plugin reinstall. Precedence is unchanged-and-extended: `SYM_NODE_NAME`/`SYM_GROUP` env still win, then `.sym/node.json`, then the auto `claude-<repo>-<session>` default. A missing or malformed file is ignored (falls back to the auto default) — never a hard fail.
+
+## 0.3.21
+
+### Changed
+
+- **`sym_inbox` is now a thin adapter over the SDK primitive `node.inbox()`** (`@sym-bot/sym` ^0.7.11). The pull-based receive buffer + drain cursor moved down into the node, where it belongs alongside `node.remember()` (send) — so the SDK is sufficient for send **and** pull on its own, and the wrapper owns no buffering logic. Behaviour is unchanged (FIFO drain, `peek`, `limit`); `sym_fetch` now also resolves SDK inbox ids (`inNNNN`). The wrapper still applies the peer allowlist + prompt-injection filter on the pull path before anything enters context.
+
+## 0.3.20
+
+### Added
+
+- **`sym_inbox` — pull-based receive (bypasses channel-push gating).** Claude Code 2.1.177 gates the real-time `<channel>` push behind a managed-settings policy + server-side allowlist, but the MCP tool layer is never gated. Every inbound CMB is already accumulated server-side (the cmb-accepted handler stores it *before* the gated push), so `sym_inbox` lets the agent **pull** messages received since its last check — directed `sym_send` addressed to it plus admitted broadcasts. FIFO drain with a read cursor (no message is skipped even past the page limit), `peek` for non-destructive reads, `limit` to page. The agent is instructed to poll `sym_inbox` at the start of a turn and periodically while coordinating, so receive works regardless of the channel-push policy gate. Compact `[mNNN]` headers; `sym_fetch` for full content.
+
+## 0.3.19
+
+### Added
+
+- **Signed CMBs (MMP §8.3) — authenticity + integrity.** Pins `@sym-bot/sym` to `^0.7.10`: every CMB is now Ed25519-signed by its author and verified receiver-side against the sending peer's handshake-announced identity key **and** its content hash. A forged, tampered, or content-swapped CMB is rejected before it can reach Claude's context (audit-metered). Unsigned CMBs are allowed for interop unless `SYM_REQUIRE_SIGNED_CMB` is set. This is the cryptographic layer above the existing Ed25519 transport identity + SVAF relevance gate + prompt-injection filter. Version-bumped (plugin + `.mcp.json` pin) so installed plugins reinstall and pick up signing on restart.
+
+## 0.3.18
+
+### Added
+
+- **Directed-delivery indicators in the channel header (MMP §9.2.2).** Pins `@sym-bot/sym` to `^0.7.9`, which adds an ingestion flag to surfaced CMBs. A CMB sent directly to this node now reads as `[peer →you]`; if SVAF delivered it but did not store it (`remixed:false`), the header adds `·not-stored` so the agent knows the directed request is transient, not recallable from mesh memory later. Broadcast CMBs are unaffected.
+
+## 0.3.17
+
+### Fixed
+
+- **Directed (peer-bound) CMBs now reach the agent.** Pins `@sym-bot/sym` to `^0.7.8`, which carries the MMP §9.2.2 delivery fix: a CMB sent to a specific recipient (`sym_send to=X`) is surfaced to the receiving agent unconditionally, regardless of the SVAF verdict — SVAF governs memory admission only. Previously every inbound CMB (directed or broadcast) ran through the group-autonomous SVAF surfacing gate, so a directed coordination CMB scored low by SVAF was silently dropped. Group-bound broadcasts (`sym_observe`) remain SVAF-gated for surfacing, unchanged. Version-bumped (plugin + `.mcp.json` pin) so installed plugins reinstall and pick up the fix on restart.
+
+## 0.3.15
+
+### Fixed
+
+- **`start` now finds `claude` on Windows.** The launch used `spawnSync('claude', …)` with no shell, which does an exact-filename lookup that ignores Windows `PATHEXT` — so `start` failed with `ENOENT` even when `claude` ran fine in the shell (there it resolves a `.cmd`/`.ps1` shim or `.exe`, never bare `claude`). The launch now routes through a shell on Windows so `PATHEXT` resolution applies; whitespace args are quoted since `shell: true` forwards them unquoted. The POSIX launch path is unchanged.
+- **`start --name` no longer silently reverts identity on a stale entry.** `start` auto-injected `--force` only on a *live* entry mismatch, but `npx` rotates its cached `server.js` path on every version resolve, so the persisted entry is routinely stale yet still holds the node's name/group. On a re-run, `start` saw no live entry, pushed no `--force`, and `init`'s preserve-over-request precedence dropped the requested `--name` — reverting the node's identity to the stale name. `start` now reconciles against the persisted entry whether or not it's stale and forces the rewrite when an explicit `--name`/`--group` differs. The group is preserved when no `--group` is passed.
+
+## 0.3.14
+
+### Added
+
+- **`sym-mesh-channel start` — one command to a live mesh session.** Configures the MCP server if needed, then launches Claude Code with the real-time Channels flag already on, so users never type `--dangerously-load-development-channels …` or have to choose between the `plugin:` and `server:` handle. `start --project --name <node> --group <team>` stands up a named mesh agent; `start --print` is a dry run; everything after `--` is forwarded to `claude`. Co-resident sessions don't collide (server.js auto-suffixes a live-identity clash since 0.3.10), so `start` in several terminals just works.
+
+### Fixed
+
+- **CLI subcommand dispatch via the published bin.** The `bin` entrypoint (`server.js`) only routed `init` to the installer, so `npx @sym-bot/mesh-channel doctor` silently fell through and started the MCP server instead. Now `init`, `doctor`, and `start` all route to the installer/launcher.
+- **`init --force` with an explicit `SYM_NODE_NAME` now relabels the entry** instead of always preserving the prior name (symmetric with how `--group` already behaves). A routine reinstall with no explicit name still preserves identity.
+
+## 0.3.13
+
+### Changed
+
+- **Track the latest released `@sym-bot/sym` (`^0.7.6`).** Pulls in the SVAF decision log (every evaluation — admit and reject — is now persisted and emitted) on top of the 0.7.5 replay-storm receive-path dedup. Additive; no API changes in mesh-channel.
+
+## 0.3.12
+
+### Changed
+
+- **Bump `@sym-bot/sym` to `^0.7.5`** — mesh replay-storm receive-path dedup (dedup received CMBs so a co-resident peer restart no longer triggers a replay storm).
+
+### Fixed
+
+- Align install commands + channel-flag handles with the actual marketplace (#13).
+- Fix 5 moderate Dependabot vulnerabilities (`npm audit fix`).
+
+## 0.3.11
+
+### Added
+
+- **Prompt-injection filter (security layer 3).** Every incoming CMB — all CAT7 fields and the opaque payload — is now scanned against a curated blocklist of injection patterns before `pushChannel()` is called. Patterns cover: instruction-override phrases ("ignore previous instructions", "forget everything you know"), role/persona hijacking ("you are now a new AI", "act as an unrestricted assistant"), system-prompt injection (`<system>`, `[SYSTEM]`, `## system prompt`), tool-call fabrication (`<tool_call>`, `<function_calls>`), and privilege-escalation language ("override safety filter", "jailbreak", "DAN mode"). Blocked CMBs are audit-logged to stderr with reason, peer name, and a truncated excerpt — never silently dropped.
+
+- **Per-peer rate limiting.** A sliding 60-second window caps each peer at `SYM_RATE_LIMIT` CMBs per minute (default: 30). CMBs exceeding the cap are blocked and audit-logged. Prevents flood attacks from a compromised or malfunctioning peer.
+
+- **Payload size cap.** Payloads larger than `SYM_MAX_PAYLOAD_BYTES` (default: 8 192 bytes) are rejected before context injection. Prevents oversized-payload attacks that could exhaust the context window.
+
+- **README security section updated** to document all four defence layers accurately.
+
+### Security model
+
+The full gate before any mesh signal reaches Claude's context is now:
+1. **Transport** — Ed25519 peer identity + relay-token auth.
+2. **Protocol** — SVAF per-field semantic relevance gate.
+3. **Safety** — prompt-injection filter + rate limiter + payload size cap (this release).
+4. **Application** — text-only injection; `claude/channel/permission` not declared.
+
+## 0.3.10
+
+### Fixed
+
+- **Live-identity-collision auto-suffix.** Two sessions wanting the same `SYM_NODE_NAME` previously hard-failed with `EIDENTITYLOCK`. The server now checks whether the name's lock file is held by a live process; if so, it appends `-2`, `-3`, … (up to 64) until it finds a free slot. Stale locks (dead holder) are still reclaimed by `@sym-bot/sym` on start — unchanged. Result: duplicate dev-agent sessions, or any two sessions sharing a fixed `SYM_NODE_NAME`, coexist instead of failing.
+
+## 0.3.9
+
+### Fixed
+
+- **stdout discipline — fixes `-32000 / Connection closed`.** The MCP JSON-RPC stream runs on stdout. Dependency load banners (e.g. `[encoder] Semantic encoder ready` from the semantic model) were printing to stdout, intermittently corrupting the handshake and causing Claude Code to log "Ignoring non-JSON line on stdout" or drop the connection with `-32000`. A stdout guard is now installed before any `require()`: lines that start with `{` (JSON-RPC frames) pass through to the real stdout; everything else is redirected to stderr. Verified: stdout is pure JSON after the fix.
+
+## 0.3.8
+
+### Added
+
+- **Per-session node identity.** Each Claude Code session now gets its own mesh identity derived from the working-directory slug and a session-unique suffix (e.g. `claude-symday-webapp-6e174e`), instead of all sessions sharing the machine hostname. Enables multiple Claude Code sessions on the same machine to appear as distinct peers on the mesh — confirmed working over loopback via Bonjour with no relay.
+
+- **`npx` launch path.** The plugin now launches via `npx @sym-bot/mesh-channel` rather than a global `node` path, so marketplace installs work without a prior `npm install -g`. The npx cache warms on first launch; subsequent sessions start in ~1 s.
+
+## 0.3.7
+
+### Changed
+
+- **Bumped `@sym-bot/sym` dependency `^0.5.8` → `^0.7.4`** to track the current sym stack. The range had drifted: sym moved through 0.6.x/0.7.x (mesh groups, Windows portability) while this wrapper still declared `^0.5.8`, so an installed sym ≥0.6 showed as `invalid` and a reinstall could nest a stale 0.5.x that shadows the global. Pinning `^0.7.4` makes the dependency honest and, in particular, **requires the loopback-capable sym (≥0.7.4)** — co-resident nodes mesh over `127.0.0.1` with no network interface (Wi-Fi off). No code change in this package; dependency-range correctness only.
+
+## 0.3.6
+
+### Added
+
+- **Group discovery beacon.** This MCP node now advertises its mesh group on a shared `_symgroups._tcp` service (group name in TXT) via the pure-JS `bonjour-service` — published on start, re-published on `sym_join_group` hot-swap, torn down on shutdown. Makes the Claude/MCP node discoverable by the `sym` CLI's `sym groups` command **cross-platform, including Windows** (where Apple's `dns-sd` is absent), so CLI-daemon and Claude/MCP nodes list together. Discovery-only — comms stay isolated on the group's own `_<group>._tcp`. `bonjour-service` pinned as a direct dependency. Validated on Windows 11.
+- **Operational note:** a session started before 0.3.6 must restart to begin beaconing.
+
+## 0.3.5
+
+### Added
+
+- **Opaque payload on `sym_send` / `sym_observe`.** Both tools accept
+  an optional `payload` argument carrying data beyond CAT7 — any
+  JSON-serializable value. Forwarded to `SymNode.remember(fields, {
+  payload, … })` (requires `@sym-bot/sym` ≥ 0.5.8) and rides the wire
+  frame to peers. Used by substrate-level protocols that need to carry
+  structured data alongside CAT7 (e.g. LLM request/response, where the
+  prompt + request_id ride in `payload` rather than getting smuggled
+  through `motivation`).
+- **Channel notifications surface payload-bearing CMBs.** When an
+  incoming peer CMB carries `cmb.payload`, the header gains a
+  `[+payload Nb]` indicator and the body stored by `sym_fetch`
+  includes a `---PAYLOAD---` section with the serialized payload.
+  Receivers learn from the header that there's structured data beyond
+  CAT7 and call `sym_fetch` to consume it.
+- Base MCP instructions now teach agents to recognise the
+  `[+payload Nb]` header and to pass structured responses via the
+  `payload` argument when emitting substrate-level CMBs.
+
+### Compatibility
+
+- Omitting `payload` produces a v0.3.4-shaped CAT7 CMB byte-for-byte.
+- Old peers (without `cmb.payload`) surface unchanged headers — no
+  `[+payload …]` indicator, no PAYLOAD section in the body.
+
+## 0.3.4
+
+### Added
+
+- **`SYM_GROUP` is now first-class in the installer.** `init` accepts a
+  `--group <name>` flag and reads the `SYM_GROUP` env var; both paths
+  persist the chosen group into the `~/.claude.json` (or project
+  `.mcp.json`) env block so every Claude Code launch auto-joins the
+  named group instead of the global `_sym._tcp` mesh.
+
+  Resolution order is `--force`-aware:
+    - With `--force` and an explicit `--group`/`SYM_GROUP`: flag/env wins
+      (one-command group switch on a live entry).
+    - Without `--force`, or with `--force` but no explicit value:
+      preserved value from any existing entry > explicit > none (omit).
+
+  `--force --group default` (or `SYM_GROUP=default`) is the explicit
+  escape hatch to revert a node from a named group back to the global
+  mesh — removes `SYM_GROUP` from the env block entirely rather than
+  writing the literal string "default".
+
+  Both `--group` and `SYM_GROUP` env values are validated against the
+  same kebab-case regex; malformed values exit with a clear error
+  before any file write.
+
+- **`doctor` now reports the persisted group per entry** and warns when
+  user-global and project-scoped entries disagree on `SYM_GROUP`.
+  Group-mismatch is the most common cause of "peers never appear in
+  `sym_peers`" with no other failure signal — surfacing it inline saves
+  the diagnostic walk that motivated this release.
+
+- **README** gains a "Persisting your group across restarts" subsection
+  under Team mesh groups, plus a troubleshooting entry covering the
+  group-mismatch failure mode. Quick-start shows the `--group` flag.
+
+### Fixed
+
+- **Stale-entry heal preserves `SYM_GROUP` alongside `SYM_NODE_NAME`.**
+  Previously, healing a stale `claude-sym-mesh` entry (args[0] points at
+  a missing server.js) silently dropped any persisted `SYM_GROUP`,
+  reverting the node to the default mesh on next launch and stranding
+  teammates who stayed in the named group. The heal path now copies
+  both fields from the prior entry into the rewrite.
+
+  Same fix applied to project-scoped entry healing under
+  `claudeJson.projects[<path>].mcpServers`.
+
+### Why this matters
+
+Before 0.3.4, the only way to persist a group was to hand-edit
+`~/.claude.json`. The README pitched `sym_join_group` as the team-mesh
+UX, but that tool is runtime-only — the next Claude Code launch reverted
+the node to the default mesh, peer count dropped to zero, and the user
+saw no diagnostic signal. The 2026-05-02 SYM.BOT incident (CMO in
+`default`, COO in `sym-bot-team`, ~24h of silent duplex outage) traced
+directly to this gap.
+
+## 0.3.3
+
+### Fixed
+
+- **Real-time duplex for CAT7 CMBs.** The `cmb-accepted` handler now
+  stores the rendered CMB body under an `[mNNN]` ID and includes that
+  ID in the channel notification, matching the contract stated in the
+  MCP instructions ("Messages arrive as compact headers with [mNNN] IDs
+  — use sym_fetch to read the full content") and the behaviour of the
+  raw-text `message` path.
+
+  Previously only the legacy raw-text `message` event persisted bodies
+  to `MESSAGE_STORE` — the primary `cmb-accepted` event (fired for
+  every structured CMB delivered via `sym_send` / `sym_observe`) pushed
+  a headline with no `[mNNN]` and left no retrievable body. Inbound
+  CMBs were admitted to the SVAF-backed memory store and surfaced by
+  `sym_recall` as compact headlines, but `sym_fetch` could not return
+  their content — the duplex was effectively headline-only for the 99%
+  case of real mesh traffic.
+
+  Symptom: after the 0.3.2 Mac↔Win fix restored bidirectional packet
+  flow, peers' structured replies appeared in `sym_recall` but returned
+  *"expired or invalid ID"* from `sym_fetch` — because `storeMessage()`
+  had never been called for them. Now both the raw-text and CAT7 paths
+  persist bodies identically.
+
+## 0.3.2
+
+### Fixed
+
+- **Pulls in `@sym-bot/sym` 0.5.1** — fixes Mac↔Windows peer connections
+  over LAN. Prior releases shipped a Bonjour advertisement whose SRV
+  target was the bare Windows NetBIOS hostname (e.g. `xmesh-hp.`) with
+  no `.local` suffix. macOS mDNSResponder only resolves `.local.` mDNS
+  names, so Macs could discover Windows peers via bonjour browse but
+  failed to open the outbound TCP connection. CMBs targeted at Windows
+  nodes never arrived; no replies came back. Full diagnosis in sym
+  0.5.1 CHANGELOG.
+
+  Upgrade required on both sides to restore Mac↔Windows traffic.
+  Existing Windows identities with a bare hostname are auto-migrated
+  on next node start; no manual config edit needed.
+
+## 0.3.1
+
+### Fixed
+
+- **Installer no longer silently ships a broken MCP config.** Previously,
+  if `~/.claude.json` already contained a `claude-sym-mesh` entry,
+  `npm install -g @sym-bot/mesh-channel` (via postinstall) and
+  `npx @sym-bot/mesh-channel init` both skipped with "already configured"
+  — even when the entry's `args[0]` server.js path no longer existed on
+  disk (common after moving or reinstalling the repo). Users saw
+  `/mcp` report "Failed to reconnect" with no diagnostic hint.
+
+  The installer now classifies entries whose `args[0]` is missing as
+  **stale** and rewrites them automatically without `--force`, preserving
+  `SYM_NODE_NAME` from the prior entry so mesh identity doesn't drift
+  back to the hostname-based default. Live entries continue to require
+  `--force` for overwrite.
+
+- **Stale project-scoped entries are now healed too.** `~/.claude.json`
+  can carry per-project `mcpServers` overrides under
+  `projects.<dir>.mcpServers`, and Claude Code prefers those over the
+  user-global entry when launched from that directory. A healthy
+  user-global entry was therefore being silently shadowed by stale
+  project entries. `init` now scans every project, rewrites any stale
+  `claude-sym-mesh` entry, and preserves each project's `SYM_NODE_NAME`.
+
+### Added
+
+- **`sym-mesh-channel doctor` subcommand.** Read-only diagnostic that
+  lists every `claude-sym-mesh` entry in `~/.claude.json` (user-global
+  and every project scope) with `[live]` or `[STALE]` plus its
+  `SYM_NODE_NAME` and configured path. Point users here when `/mcp`
+  reports "Failed to reconnect". No writes, safe to run any time.
+
+- **README troubleshooting section** covering the `/mcp` failure path,
+  how to run `doctor`, and when restart is needed after a config change.
+
+### Changed
+
+- `.claude-plugin/plugin.json` version field bumped to `0.3.1` to match
+  `package.json`. Previous drift (`plugin.json` stuck at `0.2.0`, package
+  at `0.3.0`) was caught by the in-repo version-parity test.
+
+## 0.3.0
+
+### Added
+
+- **Startup remix-memory primer — automates agent memory recall on
+  session/agent restart (MMP §4.2 O2, rejoin-without-replay).** As the
+  final step of plugin initialisation (after `node.start()` and before
+  the MCP transport connects), the plugin calls
+  `node.buildStartupPrimer()` and appends the returned text to the MCP
+  server's `instructions` field. A fresh Claude Code session wakes
+  with the agent's own remix memory — own observations plus peer
+  observations admitted by SVAF — already loaded into context. No
+  first-turn `sym_recall` required; agent acts from prior state
+  immediately.
+
+  Default caps: last 24 hours OR 20 most recent CMBs, whichever is
+  tighter. The primer lists each entry as `[timestamp] source · key —
+  focus` and surfaces a dropped-count line when caps elide older
+  entries. Empty store is a silent no-op.
+
+### Changed
+
+- **`@sym-bot/sym` dep bumped to `^0.5.0`** to pick up the
+  `buildStartupPrimer` helper and to keep every plugin on the
+  sym.day platform pinned to the same substrate SDK version
+  (no drift across mesh-channel / melotune-plugin / future
+  specialised plugins).
+
+## 0.2.0
+
+### Breaking
+
+- **`sym_send` tool signature change.** `sym_send` now emits a structured
+  CAT7 CMB (MMP §4.2) instead of a raw-text `type:'message'` frame, and
+  accepts an optional `to` parameter for targeted single-peer delivery
+  per MMP §4.4.4.
+
+  Old signature: `sym_send(message: string)`
+  New signature: `sym_send(focus: string (required), issue?, intent?,
+  motivation?, commitment?, perspective?, mood?, to?)`
+
+  Migration: agents that previously called `sym_send({message: "..."})`
+  should now pass the CAT7 fields explicitly, with `focus` carrying the
+  task anchor for the send. Prior ephemeral text-broadcast behaviour is
+  no longer exposed at the tool surface — `sym_send` and `sym_observe`
+  both emit CMBs now, receivers run SVAF per §9.2, and admitted CMBs are
+  remix-stored with lineage. The low-level `node.send(text)` SDK API is
+  unchanged but no longer surfaced as a tool.
+
+### Added
+
+- **Targeted CMB send.** `sym_send` resolves `to` against connected
+  peers by full nodeId first, then display name, then 8-char prefix.
+  Ambiguous matches return an error asking for the full nodeId; a
+  disconnected target returns an error and suggests `sym_peers`.
+- **Tool descriptions** for `sym_send` and `sym_observe` now explicitly
+  call out the SVAF receive path and lineage semantics, and the MCP
+  server's `instructions` string reflects the new division of labour.
+- **`@sym-bot/sym` dependency bumped to `^0.3.81`** for
+  `remember(fields, {to})` targeted variant and `peers().peerId`.
+
+## 0.1.23
+
+### Added
+
+- **`sym_join_group(group, relay_url?, relay_token?)`** — hot-swap this
+  node into a different mesh group at runtime, no Claude Code restart.
+  Stops the current SymNode, reconstructs it on the new service type
+  (and optional relay), re-registers event handlers, restarts. The
+  "smooth way to join" that was missing in 0.1.22.
+
+- **`sym_invite_create(group, relay_url?, relay_token?)`** — generate
+  a shareable invite URL for a named group. Two flavors:
+  - LAN-only: `sym://group/{name}` (Bonjour isolation only)
+  - Cross-network: `sym://team/{name}?relay=...&token=...` (routes via
+    a WebSocket relay so teammates on different networks can join).
+  Validates kebab-case group names, rejects token without URL.
+
+- **`sym_invite_info(url)`** extended to parse the new `sym://team/`
+  path and the `relay=` + `token=` query-string parameters.
+  Output now includes a ready-to-paste `sym_join_group` call as JSON.
+
+- **`sym_groups_discover()`** — enumerate SYM-mesh groups currently
+  advertising on the local LAN via Bonjour / mDNS. Shell-outs to
+  `dns-sd` (macOS/Windows) or `avahi-browse` (Linux) with a 2-second
+  timeout, filters to service types matching the SYM protocol family
+  (global `_sym._tcp`, named groups, `{app}-{id}` rooms). Peer-to-peer
+  means only groups with live members right now are visible — no
+  central directory.
+
+- **README — "Dev-team groups" walkthrough** with two concrete scenarios:
+  LAN dev-team group (single office) and cross-network team group via
+  the public `wss://sym-relay.onrender.com` relay. Shows exact tool
+  calls from both the team lead and each teammate.
+
+- **13 new tests** covering invite URL parse, generate, round-trip, and
+  validation (kebab-case, token-requires-URL guard). Test suite now at
+  35 tests total.
+
+### Changed
+
+- Module-level `node`, `GROUP`, `SERVICE_TYPE`, `RELAY_URL`,
+  `RELAY_TOKEN` declared as `let` (was `const`) so the hot-swap path
+  can re-bind them. All node event handlers (`identity-collision`,
+  `cmb-accepted`, `message`) extracted into a single
+  `registerNodeHandlers(n)` function so the hot-swap path re-attaches
+  them without duplicating logic.
+
+- Tool count in README corrected to 11 (was 8 in 0.1.22):
+  + sym_invite_create, sym_join_group, sym_groups_discover.
+
+## 0.1.22
+
+### Added
+
+- **Plugin marketplace distribution**: `.claude-plugin/marketplace.json`
+  enables direct install via the Claude Code plugin marketplace without
+  waiting on the Anthropic Plugin Directory propagation pipeline:
+
+  ```
+  /plugin marketplace add sym-bot/sym-mesh-channel
+  /plugin install sym-mesh-channel@sym-mesh-channel
+  ```
+
+  Validates cleanly with `claude plugin validate .` and installs
+  end-to-end with no manual steps.
+
+- **`LICENSE`** file (Apache-2.0). `package.json` already declared
+  Apache-2.0 but no LICENSE text was present in the repo; this
+  aligns the distribution with SPDX expectations.
+
+- **MMP §5.8 mesh-group support** — LAN isolation via Bonjour service
+  type so Claude Code sessions can join app-specific meshes (e.g.
+  MeloTune mood rooms on `_melotune._tcp`) instead of the global
+  `_sym._tcp` mesh. Enables cross-app CMB delivery without cross-app
+  noise: nodes in different groups never discover each other at mDNS.
+
+  Config surface (two equivalent paths):
+  - `SYM_GROUP=<name>`       → service type `_<name>._tcp`
+  - `SYM_SERVICE_TYPE=<st>`  → explicit override (`_foo._tcp` form)
+
+  Default remains `_sym._tcp` / `group=default` — backward compatible.
+
+- **Two new MCP tools for mesh-group operations**:
+  - `sym_group_info` — reports current group + service type + peer
+    roster scoped to this group.
+  - `sym_invite_info` — parses app-specific invite URLs
+    (`melotune://room/{id}/{name}`, `sym://group/{name}`) into service
+    type + group + room name. Read-only inspection; caller opens a
+    new session/env to join.
+
+  `sym_status` output now includes `Group` + service type.
+
+### Fixed
+
+- **`plugin.json` validation failure on install.** The three
+  `channels[0].userConfig` entries (`relay_url`, `relay_token`,
+  `allowed_peers`) were missing the required `type` and `title`
+  fields per the Claude Code plugin schema. Install failed with:
+
+  ```
+  channels.0.userConfig.relay_url.type: Invalid option
+  channels.0.userConfig.relay_url.title: expected string, received undefined
+  ```
+
+  Added `type: "string"` and a human-readable `title` to all three.
+  Likely one of the root causes of the 10 Apr 2026 submission
+  showing "Published" on the Anthropic submissions portal but not
+  propagating to the public `claude-plugins-official` marketplace.
+
+### Changed
+
+- **README**: self-hosted plugin-marketplace install path promoted to
+  the primary install recommendation (works today, independent of
+  Anthropic directory propagation). npm path kept as alternative.
+  Tool table updated 5 → 8 entries to reflect the current surface.
+  Clarified that plugin-directory approval and Channels-allowlist
+  inclusion are independent gates — the MCP tools work without the
+  `--dangerously-load-development-channels` flag; the flag is only
+  needed for the `<channel>` async-push behaviour.
+
+- Pairs with `@sym-bot/sym` ≥ 0.3.78 which added the
+  `discoveryServiceType` and `group` constructor params consumed by
+  the mesh-group tools.
+
+## 0.1.21
+
+### Changed
+
+- **README: accurate `sym_status` / `sym_peers` example output.** The
+  Quick Start sample output was a stylized one-line compression; the
+  real output is multi-line with additional fields (nodeId suffix,
+  Relay, Memories, one peer per line). Updated so users see in the
+  README exactly what their terminal will show. Doc-only — no code
+  changes.
+
+## 0.1.20
+
+### Added
+
+- **`sym-mesh-channel init --project`** — new flag to install the MCP
+  server at project scope (`<cwd>/.mcp.json` + merged
+  `<cwd>/.claude/settings.local.json`) instead of global
+  `~/.claude.json`. Enables multi-identity-per-machine workflows where
+  several Claude Code sessions run in parallel from distinct project
+  directories and each appears as its own peer on the mesh. Project
+  `.mcp.json` entries override the global `mcpServers` entry when
+  Claude Code launches from that directory, so `SYM_NODE_NAME` can
+  differ per project without siblings stepping on each other.
+- Project mode supports the same `--force` semantics as global install:
+  backs up existing `.mcp.json` and `settings.local.json` next to
+  themselves (`*.bak-<timestamp>`), merges `settings.local.json` so
+  unrelated keys (permissions, custom settings) are preserved, atomic
+  writes via tmp+rename, refuses to overwrite an existing
+  `claude-sym-mesh` entry without `--force`.
+- `--postinstall` always runs global install regardless of `--project`
+  (npm postinstall runs from npm's staging dir, not the user's
+  project). Keeps `npm install -g` auto-configure behavior unchanged.
+- **5 new tests** covering project-mode install: writes `.mcp.json`
+  and `settings.local.json`, merge preserves existing keys, refusal
+  path exits 2, `--force` overwrite creates backup, postinstall
+  fallback ignores `--project`. Test suite now 22 tests total.
+
+### Why
+
+Default mode (single mesh identity per machine, global install) is
+correct for most users and unchanged. `--project` exists for the
+small but real set of users who run multiple Claude Code sessions
+in parallel from distinct project directories and want each session
+to show up as its own peer on the mesh. Previously this workflow
+required hand-editing `.mcp.json` and `.claude/settings.local.json`
+per project; now it's one command per project.
+
+## 0.1.19
+
+### Added
+
+- **Claude Code plugin manifest** for Anthropic Channels allowlist
+  submission. `.claude-plugin/plugin.json` + `.mcp.json` following the
+  official single-repo pattern (Telegram/Discord). Submitted to
+  Anthropic Plugin Directory 10 Apr 2026.
+- **`SYM_ALLOWED_PEERS`** — optional peer allowlist (defense-in-depth).
+  Comma-separated node names; only listed peers can push to Claude's
+  context. Empty = accept all authenticated peers. SVAF still gates on
+  content relevance regardless.
+- **`SECURITY.md`** — 3-layer defense model documentation (transport
+  auth + SVAF content gate + peer allowlist) for Anthropic review.
+- **17 plugin tests** covering manifest validation, security checks
+  (no permission relay, no code execution, self-echo filtering, peer
+  allowlist), and lifecycle (shutdown handlers, identity collision).
+
+## 0.1.18
+
+### Changed
+
+- **Auto-configure on install.** `npm install -g` now runs `postinstall`
+  that writes the MCP server config to global `mcpServers` in
+  `~/.claude.json` automatically. No separate `sym-mesh-channel init`
+  step needed — two commands to mesh: install + launch.
+- **Global MCP config** — server entry is now written to top-level
+  `mcpServers` (available in all Claude Code sessions), not
+  project-scoped.
+- **Windows postinstall fixes** — `require.resolve` for server.js path
+  (handles npm staging directory on Windows), EBUSY handling when
+  Claude Code has `~/.claude.json` locked, graceful skip if Claude
+  Code not yet installed.
+- **README repositioned** — lead with capability ("first non-Anthropic
+  Claude Code Channels implementation"), not use case. Simplified
+  Quick Start to two commands.
+- **0 vulnerabilities** — fresh dependency rebuild resolves all 6
+  moderate hono/node-server advisories.
+- Windows mDNS: built-in on Windows 10+, no Bonjour install needed.
+
+## 0.1.7
+
+### Added
+
+- **`npx @sym-bot/mesh-channel init`** — interactive installer that
+  writes `~/.claude.json` for the current project, picks a sensible
+  default `SYM_NODE_NAME` (`claude-mac` / `claude-win` / `claude-linux`),
+  resolves the absolute path to `server.js`, and prints the launch
+  command including the `--dangerously-load-development-channels` flag.
+  Backs up the existing config to `~/.claude.json.bak-<timestamp>`,
+  validates JSON round-trip, atomic write via tmp+rename. Refuses to
+  overwrite an existing entry without `--force`.
+- **README rewritten for LAN-first install.** Quick start is two
+  minutes: install, init, launch. No relay required. Bonjour/mDNS
+  is the default discovery path. Cross-network setup (relay) is now
+  the optional advanced section.
+
+### Changed
+
+- `package.json` `bin` now exposes both `sym-mesh-channel` (server
+  entrypoint) and `sym-mesh-channel-init` (installer). The package
+  description leads with "LAN-first via Bonjour, no relay required."
+
+### Why
+
+The 0.1.5/0.1.6 install path required users to manually edit
+`~/.claude.json`, know about the Channels dev flag, set up a relay,
+and obtain a relay token. That gated the demo behind real friction.
+LAN-only mode has worked since day one in the underlying SymNode
+(`sym/lib/node.js:509-511` only connects to the relay if `SYM_RELAY_URL`
+is set; Bonjour discovery starts unconditionally), but no documentation
+or installer surfaced it. This release closes that gap: two users on
+the same wifi can join the same mesh in two minutes with three commands.
+
+## 0.1.6
+
+### Fixed
+
+- `sym_send` no longer double-delivers. Previously called both
+  `node.send()` (broadcast as `event_type=message`) AND `node.remember()`
+  (persist as CMB which gets gossiped as `event_type=cmb`), causing
+  the same payload to arrive twice on receivers and double the
+  context-window cost. Now broadcasts the message frame only. Hosts
+  that want CMB persistence should call `sym_observe` separately
+  with proper CAT7 fields.
+- `sym_send` now reports the actual delivered count, not
+  `peers().length`. Requires `@sym-bot/sym >= 0.3.70` where `send()`
+  returns the count of peer transports that successfully accepted
+  the broadcast. The two can disagree when peers are tracked but
+  have broken transports — the delivered count is the truth about
+  what was actually sent.
+
+### Changed
+
+- Bumped `@sym-bot/sym` dep `^0.3.69` → `^0.3.70`. 0.3.70 ships the
+  identity lockfile that prevents two SymNode processes from
+  claiming the same nodeId on a host (the cliHostMode-vs-MCP
+  collision that broke real-time push on Windows during the
+  2026-04-09 round-trip test).
+
+## 0.1.5
+
+### Changed
+
+- Bumped `@sym-bot/sym` dep `^0.3.68` → `^0.3.69` (0.3.68 deprecated;
+  same code in 0.3.69 with a cleaner published tarball).
+- Added `files` whitelist to `package.json` and `.npmignore` for
+  `*.bak`, `*.swp`, `.DS_Store` so future publishes can't accidentally
+  ship local backup files. First NPM publish of this package.
+
+## 0.1.4
+
+### Changed
+
+- Bumped `@sym-bot/sym` dep `^0.3.43` → `^0.3.68` to pick up
+  duplicate-identity refusal (close code 4004) and the new
+  `identity-collision` event.
+
+### Added
+
+- Wired `node.on('identity-collision', ...)` to `process.exit(2)` so
+  the MCP dies cleanly when the relay reports a duplicate-identity
+  race. Together with v0.1.3's clean shutdown, this fully resolves
+  the host-side half of the duplicate-identity bug.
+
+## 0.1.3
+
+### Added
+
+- Clean shutdown handlers (SIGTERM/SIGINT/SIGHUP) that call
+  `node.stop()` before exiting, so the SymNode disconnects from the
+  relay before the process dies. Without this, restarts left zombie
+  registrations on the relay until the next heartbeat tick (up to
+  30s), creating a duplicate-identity race window for the next MCP
+  spawn. Idempotent re-entry guard.
+
+## 0.1.2
+
+### Fixed
+
+- Suppressed `peer-joined` / `peer-left` events from being pushed to
+  Claude's context as `<channel>` notifications. Presence is high-
+  frequency and low-signal — a relay reconnect could fire one event
+  per peer per cycle, flooding the context window. CMBs and direct
+  messages still flow through.
+
+## 0.1.1
+
+### Changed
+
+- Replaced hardcoded `claude-code` / `claude-code-mac` literals with
+  a single `NODE_NAME` constant sourced from `process.env.SYM_NODE_NAME`
+  (default `claude-code-mac`). Enables platform-scoped naming per
+  MMP §3.1.2 without source edits. Fixed stale display strings in
+  the MCP instructions, `sym_send` perspective, `sym_status` header,
+  and the self-echo dedup filter.
+
+## 0.1.0
+
+### Added
+
+- Initial release. MCP server that runs a `SymNode` peer node inside
+  a Claude Code session — own identity, own relay connection, own
+  SVAF evaluation. Tools: `sym_send`, `sym_observe`, `sym_recall`,
+  `sym_peers`, `sym_status`. Mesh events arrive as `<channel>`
+  notifications when launched with
+  `claude --dangerously-load-development-channels server:claude-sym-mesh`
+  (allowlisted server name required by Claude Code Channels).
